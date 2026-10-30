@@ -57,8 +57,9 @@ def _compile_all(dims):
     norm.add_rmsnorm_fwd_kernel.warmup(
         f32, f16, f32, f32, f16, f32, f32, torch.bool, torch.bool, i64, f16, f16, hidden, 1e-6,
         1.05, 1.05, 1, 0, 1, BLOCK_H=block_h, num_warps=8, grid=GRID)
-    nf4.nf4_dequant_kernel.warmup(u8, u8, f32, f32, f32, f16, 0.5, 1024, BLOCK=nf4.BLOCK_BYTES,
-                                  num_warps=4, enable_fp_fusion=False, grid=GRID)
+    slot = (u8, u8, f32, f32, f32, f16, 0.5, 1024)
+    nf4.nf4_dequant_kernel.warmup(*slot, *slot, *slot, 16, 16, BLOCK=nf4.BLOCK_BYTES, num_warps=4,
+                                  enable_fp_fusion=False, grid=GRID)
     rope.qkv_rope_fwd_kernel.warmup(f16, f16, f16, f32, f32, i64, f16, f16, f16, 64, 0, NQ=nq,
                                     NKV=nkv, D=head_dim, HEADS=heads, HAS_LQ=True, HAS_LV=True,
                                     num_warps=4, grid=GRID)

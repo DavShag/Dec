@@ -21,10 +21,10 @@ BLOCK_BYTES = 1024
 
 
 @triton.jit
-def nf4_dequant_kernel(packed_ptr, absmax_ptr, absmax2_ptr, code2_ptr, code_ptr, out_ptr, offset,
-                       n_bytes, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    byte = pid * BLOCK + tl.arange(0, BLOCK)
+def _dequant_block(packed_ptr, absmax_ptr, absmax2_ptr, code2_ptr, code_ptr, out_ptr, offset,
+                   n_bytes, blk, BLOCK: tl.constexpr):
+    """BLOCK packed bytes of one weight -> 2 * BLOCK fp16 weights."""
+    byte = blk * BLOCK + tl.arange(0, BLOCK)
     inside = byte < n_bytes
     packed = tl.load(packed_ptr + byte, mask=inside, other=0).to(tl.int32)
     block = byte // 32  # 64 weights per absmax, two weights per byte
@@ -34,8 +34,23 @@ def nf4_dequant_kernel(packed_ptr, absmax_ptr, absmax2_ptr, code2_ptr, code_ptr,
     high = tl.load(code_ptr + (packed >> 4)) * scale
     low = tl.load(code_ptr + (packed & 15)) * scale
     pairs = tl.reshape(tl.join(high, low), [2 * BLOCK])
-    pos = pid * (2 * BLOCK) + tl.arange(0, 2 * BLOCK)
+    pos = blk * (2 * BLOCK) + tl.arange(0, 2 * BLOCK)
     tl.store(out_ptr + pos, pairs.to(tl.float16), mask=pos < 2 * n_bytes)
+
+
+@triton.jit(do_not_specialize=["n0", "n1", "n2", "blocks0", "blocks1"])
+def nf4_dequant_kernel(p0, a0, b0, c0, k0, o0, off0, n0, p1, a1, b1, c1, k1, o1, off1, n1,
+                       p2, a2, b2, c2, k2, o2, off2, n2, blocks0, blocks1, BLOCK: tl.constexpr):
+    """Up to three weights (q|k|v, gate|up, or one) in one launch: the first blocks0 programs
+    dequantize weight 0, the next blocks1 weight 1, the rest weight 2. One launch per group keeps
+    the per-launch CPU cost (Python launcher, harness timing) off the critical path."""
+    pid = tl.program_id(0)
+    if pid < blocks0:
+        _dequant_block(p0, a0, b0, c0, k0, o0, off0, n0, pid, BLOCK)
+    elif pid < blocks0 + blocks1:
+        _dequant_block(p1, a1, b1, c1, k1, o1, off1, n1, pid - blocks0, BLOCK)
+    else:
+        _dequant_block(p2, a2, b2, c2, k2, o2, off2, n2, pid - blocks0 - blocks1, BLOCK)
 
 
 class NF4Weight:
@@ -52,13 +67,9 @@ class NF4Weight:
         self.rows, self.cols = state.shape
         self.n_bytes = self.packed.numel()
 
-    def dequantize_into(self, out):
-        """Write this weight as fp16 [rows, cols] into `out` (contiguous, same shape)."""
-        grid = (triton.cdiv(self.n_bytes, BLOCK_BYTES),)
-        nf4_dequant_kernel[grid](self.packed, self.absmax, self.absmax2, self.code2, self.code, out,
-                                 self.offset, self.n_bytes, BLOCK=BLOCK_BYTES, num_warps=4,
-                                 enable_fp_fusion=False)  # bitsandbytes rounds mul, then add
-        return out
+    def args(self, out):
+        return (self.packed, self.absmax, self.absmax2, self.code2, self.code, out, self.offset,
+                self.n_bytes)
 
 
 def nf4_supported(module):
@@ -74,13 +85,22 @@ def nf4_supported(module):
 
 
 def dequantize_stack(weights):
-    """The weights stacked by rows, fp16 [sum(rows), cols]."""
+    """The weights stacked by rows, fp16 [sum(rows), cols]: one launch per three weights."""
     out = torch.empty((sum(w.rows for w in weights), weights[0].cols), dtype=torch.float16,
                       device=weights[0].packed.device)
     row = 0
-    for w in weights:
-        w.dequantize_into(out[row:row + w.rows])
-        row += w.rows
+    for first in range(0, len(weights), 3):
+        group, slots = weights[first:first + 3], []
+        for w in group:
+            slots.append(w.args(out[row:row + w.rows]))
+            row += w.rows
+        blocks = [triton.cdiv(slot[-1], BLOCK_BYTES) for slot in slots]
+        while len(slots) < 3:  # unused slots: never reached, they get no programs
+            slots.append(slots[0][:-1] + (0,))
+            blocks.append(0)
+        nf4_dequant_kernel[(sum(blocks),)](*slots[0], *slots[1], *slots[2], blocks[0], blocks[1],
+                                           BLOCK=BLOCK_BYTES, num_warps=4,
+                                           enable_fp_fusion=False)  # bnb rounds mul, then add
     return out
 
 
