@@ -1,19 +1,19 @@
 # Soup Kernel Challenge: fused QLoRA training on a Kaggle T4
 
 Our `solution/` makes the fixed `soup train` run (Qwen2.5-1.5B-Instruct, NF4, LoRA r=16 on
-q_proj/v_proj, 64 steps on a Kaggle T4) **1.57x faster and 4.89x lighter**, with
+q_proj/v_proj, 64 steps on a Kaggle T4) **1.77x faster and 5.07x lighter**, with
 the same training: the same batches, the same LoRA dropout masks, the same Soup outputs, and an
 adapter whose held-out loss matches the base run's to -0.001%.
 
-Seven Triton kernels of our own (`@triton.jit`, all in `solution/`) take 12.0% of the training
+Seven Triton kernels of our own (`@triton.jit`, all in `solution/`) take 13.0% of the training
 time; everything around them is a handful of patches applied by `solution.apply()`.
 
 | Kaggle T4, our run (`harness/run_task.py --repeats 2`) | Base Soup 0.77.0 | Ours | |
 |---|---|---|---|
-| Whole `soup train` (start to saved adapter) | 86.1 s | 54.8 s | **1.57x** |
-| Peak GPU memory (nvidia-smi) | 14,345 MiB | 2,935 MiB | **4.89x** less |
-| Training loop alone (64 steps) | 60.2 s | 32.1 s | |
-| Held-out loss of the adapter (public rows) | 2.04963 | 2.04961 | -0.001% |
+| Whole `soup train` (start to saved adapter) | 84.9 s | 48.0 s | **1.77x** |
+| Peak GPU memory (nvidia-smi) | 14,345 MiB | 2,831 MiB | **5.07x** less |
+| Training loop alone (64 steps) | 58.4 s | 28.7 s | |
+| Held-out loss of the adapter (public rows) | 2.04968 | 2.04965 | -0.001% |
 | `harness/check_rules.py` | | all 10 checks pass | |
 
 Links: Kaggle notebook KAGGLE_LINK · final commit COMMIT_LINK
@@ -71,8 +71,9 @@ bitsandbytes' layout decoded in one pass: two 4-bit codes per byte (high nibble 
 is code[nibble] × (code2[absmax_q] × absmax2 + offset) with an absmax per 64 weights and an
 absmax2 per 256 absmax values (double quantization). Bit-identical to `bnb.dequantize_4bit`
 (checked in the tests; the kernel is compiled without FMA contraction because bitsandbytes rounds
-the multiply and the add separately). q|k|v and gate|up are dequantized into one buffer in one
-launch and share their input: q|k|v becomes one GEMM with the bias in the cuBLAS epilogue. The
+the multiply and the add separately). q|k|v are dequantized into one buffer in one launch and
+share their input: one GEMM with the bias in the cuBLAS epilogue; gate and up are dequantized one
+after the other, so a single 27.5 MB buffer is alive at a time. The
 outputs stay fp16 (they are fp16 GEMM results either way; the base run kept fp32 copies), and
 nothing is saved for backward but the packed weights. *Format:* QLoRA (Dettmers et al. 2023).
 
@@ -152,7 +153,8 @@ without changing any value the run produces.
 - transformers loads each checkpoint tensor with one `.to(device, dtype)`, and for a CPU tensor
   PyTorch converts bf16 to fp16 on the CPU before the copy. We copy first and convert on the GPU:
   the same IEEE conversion, and the loaded 4-bit model is bit-identical (a digest of every packed
-  weight, absmax and table). `from_pretrained`: 2.4–3.6 s → 1.1 s on our machine.
+  weight, absmax and table). `from_pretrained`: 2.4–3.6 s → 1.1 s on our machine, 2.3 s →
+  1.3–1.8 s on the T4 (its timeline, below the map's 3.0 s → 0.5–0.6 s).
 - bitsandbytes rebuilt its 16-entry NF4 table, with a host-to-device copy, for each of the 196
   linears it quantizes; we build it once.
 
@@ -193,23 +195,25 @@ python harness/check_rules.py
 
 ## Limitations and what we would do next
 
-- About 20 s of the ~54.8 s were not training: Python imports, model loading and
-  quantization, the trainer's setup, saving. `startup.py` removes the avoidable part of loading and
-  of the dataset preparation; the imports (~5 s) and the rest are the same as in the base run and
-  cap the speedup.
+- About 19 s of the ~48 s are not training (26 s of the base's 85 s): Python imports, model
+  loading and quantization, the trainer's setup, saving. `startup.py` removes the avoidable part of
+  loading and of the dataset preparation; the imports and the rest are the same as in the base run
+  and cap the speedup.
 - The GEMMs (cuBLAS, ~26 TFLOPS on the T4) are now ~65% of a step. A fused W4A16 GEMM in Triton
   would remove the dequantization pass (~10% of a step) but has to match cuBLAS on Turing's
   tensor cores to pay off; we did not get there.
 - PyTorch's dropout kernel still runs once per adapter per layer only to draw the masks the base
   run draws; reproducing its Philox stream in Triton would remove it but is fragile.
 - Attention is PyTorch's memory-efficient SDPA per row; a varlen flash-attention kernel with GQA
-  would avoid repeating k/v and the per-row launches.
+  would avoid repeating k/v for the kernel (backward already keeps them un-repeated) and the per-row
+  launches.
 - We tried moving the MLP activations to pinned host memory on a side stream instead of
   recomputing them (copies overlapped with the GEMMs, prefetched in backward). It saved ~2 s per
   run but raised the nvidia-smi peak by up to 2 GiB: blocks freed across streams stay reserved by
   PyTorch's caching allocator until the copies finish. We dropped it.
-- The T4 sessions differ: across our runs the base took 77-88 s and the speedup came out between
-  1.40x and 1.75x for the same code; the memory ratio is stable (the peak is deterministic).
+- The T4 sessions differ: across our runs the base took 80–90 s, and the same code's speedup moves
+  by a few percent between sessions (1.70x–1.77x for this code and its predecessor; two runs of one
+  build in one session differed by 3 s); the memory ratio is stable (the peak is deterministic).
 - The fused path supports exactly this setup (Qwen2, NF4 with double quantization, LoRA on q/v,
   right padding, CUDA); other configurations run the original code.
 
