@@ -47,10 +47,12 @@ def _compile_all(dims):
     # forward, in the order a step first needs them
     integrate.embed_fp32_kernel.warmup(i64, f16, f32, hidden, BLOCK_H=block_h, num_warps=4,
                                        grid=GRID)
-    for has_delta, write32 in ((False, True), (True, True), (True, False)):
+    for has_delta, lora in ((False, True), (True, True), (True, False)):
         norm.add_rmsnorm_fwd_kernel.warmup(
-            f32, f16 if has_delta else f32, f32, f32, f16, f32 if write32 else f16, f32, hidden,
-            1e-6, HAS_DELTA=has_delta, WRITE32=write32, BLOCK_H=block_h, num_warps=8, grid=GRID)
+            f32, f16 if has_delta else f32, f32, f32, f16, f16, f32, torch.bool if lora else f32,
+            torch.bool if lora else f32, i64 if lora else f32, f16, f16, hidden, 1e-6, 1.05, 1.05,
+            HAS_DELTA=has_delta, WRITE32=False, LORA=lora, BLOCK_H=block_h, num_warps=8,
+            grid=GRID)
     nf4.nf4_dequant_kernel.warmup(u8, u8, f32, f32, f32, f16, 0.5, 1024, BLOCK=nf4.BLOCK_BYTES,
                                   num_warps=4, enable_fp_fusion=False, grid=GRID)
     rope.qkv_rope_fwd_kernel.warmup(f16, f16, f16, f32, f32, i64, f16, f16, f16, 64, 0, NQ=nq,
@@ -68,10 +70,12 @@ def _compile_all(dims):
                                     KV_HEADS=triton.next_power_of_2(nkv), num_warps=4, grid=GRID)
     swiglu.example_swiglu_bwd_kernel.warmup(f16, f16, f16, f16, f16, 8960 * 16,
                                             BLOCK=swiglu.BLOCK, grid=GRID)
-    for gy32, gsum in ((True, True), (False, True), (False, False)):
+    for lora, gsum in ((True, True), (False, True), (False, False)):
         norm.add_rmsnorm_bwd_kernel.warmup(
-            f32, f32, f32, f16, f32, f32, f32, f16, hidden, HAS_GY16=True, HAS_GY32=gy32,
-            HAS_GSUM=gsum, WRITE_DDELTA=True, BLOCK_H=block_h, num_warps=8, grid=GRID)
+            f32, f32, f32, f16, f32, f32, f16 if lora else f32, f16 if lora else f32,
+            torch.bool if lora else f32, torch.bool if lora else f32, i64 if lora else f32, f32,
+            f16, hidden, 1.05, 1.05, HAS_GY16=True, HAS_GY32=False, HAS_GSUM=gsum, LORA=lora,
+            WRITE_DDELTA=True, BLOCK_H=block_h, num_warps=8, grid=GRID)
 
 
 def _run():

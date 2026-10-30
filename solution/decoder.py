@@ -122,16 +122,28 @@ class Unpad:
         self.lengths = lengths.tolist()
         self.ones = None
 
+    def keep(self, p, hidden):
+        """The keep mask F.dropout draws for a padded [B, T, hidden] fp32 input: the same kernel on
+        the same shape and dtype, so the same RNG draw and the same mask as the base run, as a
+        [B*T, hidden] bool tensor over the padded positions."""
+        if self.ones is None or self.ones.shape[-1] != hidden:
+            self.ones = torch.ones((self.batch, self.seq, hidden), dtype=torch.float32,
+                                   device=self.pidx.device)
+        return torch.native_dropout(self.ones, p, True)[1].view(-1, hidden)
+
     def dropout(self, x, p):
-        """F.dropout of the padded [B, T, H] fp32 input, on the real rows: the same RNG draw (same
-        shape, dtype and op as the base run, so the same keep mask), then x * (1/(1-p)) where kept,
-        which is the exact product the dropout kernel forms."""
-        if self.ones is None or self.ones.shape[-1] != x.shape[-1]:
-            self.ones = torch.ones((self.batch, self.seq, x.shape[-1]), dtype=torch.float32,
-                                   device=x.device)
-        keep = torch.native_dropout(self.ones, p, True)[1]
-        keep = keep.view(-1, x.shape[-1]).index_select(0, self.pidx)
+        """F.dropout of the padded fp32 input, on the real rows: x * (1/(1-p)) where kept, the
+        exact product the dropout kernel forms."""
+        keep = self.keep(p, x.shape[-1]).index_select(0, self.pidx)
         return torch.where(keep, x * (1.0 / (1.0 - p)), 0.0)
+
+
+def _dropout_p(parts):
+    """p of an adapter's dropout when it is an active nn.Dropout, else None."""
+    dropout = parts[0] if parts else None
+    if isinstance(dropout, torch.nn.Dropout) and dropout.training and dropout.p > 0:
+        return dropout.p
+    return None
 
 
 def _lora_out(parts, x32, unpad):
@@ -157,17 +169,28 @@ def _attention(q, k, v, lengths, scaling):
 
 
 def _layer(plan, layer, x, pending, cos, sin, unpad):
-    total, h16, h32 = add_rmsnorm(x, pending, layer.norm1.weight, plan.eps,
-                                  want32=layer.lora_q is not None or layer.lora_v is not None)
+    p_q, p_v = _dropout_p(layer.lora_q), _dropout_p(layer.lora_v)
+    if p_q is not None and p_v is not None:
+        # the q then v masks, in the base run's RNG order; the norm kernel applies them
+        hidden = x.shape[-1]
+        lora = (unpad.keep(p_q, hidden), unpad.keep(p_v, hidden), unpad.pidx, 1.0 / (1.0 - p_q),
+                1.0 / (1.0 - p_v))
+        total, h16, _, xq, xv = add_rmsnorm(x, pending, layer.norm1.weight, plan.eps, lora=lora)
+        (_, a_q, b_q, s_q), (_, a_v, b_v, s_v) = layer.lora_q, layer.lora_v
+        lq, lv = b_q(a_q(xq)) * s_q, b_v(a_v(xv)) * s_v  # PEFT's expression, under autocast
+    else:
+        total, h16, h32, _, _ = add_rmsnorm(
+            x, pending, layer.norm1.weight, plan.eps,
+            want32=layer.lora_q is not None or layer.lora_v is not None)
+        lq, lv = _lora_out(layer.lora_q, h32, unpad), _lora_out(layer.lora_v, h32, unpad)
+        del h32
     residual = total if pending is not None else x
     qkv = nf4_linear(h16, layer.qkv, layer.qkv_bias)
-    lq, lv = _lora_out(layer.lora_q, h32, unpad), _lora_out(layer.lora_v, h32, unpad)
-    del h32
     q, k, v = qkv_rope(qkv, lq, lv, cos, sin, unpad.pidx, unpad.seq, plan.nq, plan.nkv,
                        plan.head_dim)
     attn = _attention(q, k, v, unpad.lengths, layer.scaling)
-    residual, m16, _ = add_rmsnorm(residual, nf4_linear(attn, layer.o), layer.norm2.weight,
-                                   plan.eps)
+    residual, m16, _, _, _ = add_rmsnorm(residual, nf4_linear(attn, layer.o), layer.norm2.weight,
+                                         plan.eps)
     gate, up = nf4_linear(m16, layer.gate_up)
     return residual, nf4_linear(swiglu(gate, up), layer.down)
 
@@ -187,7 +210,7 @@ def decoder_forward(model, plan, input_ids, attention_mask, position_ids):
     x, pending = model.embed_tokens(input_ids.reshape(-1).index_select(0, unpad.pidx)), None
     for layer in plan.layers:
         x, pending = _layer(plan, layer, x, pending, cos, sin, unpad)
-    _, hidden, _ = add_rmsnorm(x, pending, plan.final_norm.weight, plan.eps)
+    _, hidden, _, _, _ = add_rmsnorm(x, pending, plan.final_norm.weight, plan.eps)
     return hidden, unpad
 
 

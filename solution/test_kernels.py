@@ -161,7 +161,7 @@ def test_add_rmsnorm_matches_pytorch(with_delta):
     g32 = torch.randn(3, 37, 1536, device="cuda")
     gsum = torch.randn(3, 37, 1536, device="cuda")
 
-    total, y16, y32 = add_rmsnorm(x, delta, weight, 1e-6, want32=True)
+    total, y16, y32, _, _ = add_rmsnorm(x, delta, weight, 1e-6, want32=True)
     loss = (y16.float() * g16.float()).sum() + (y32 * g32).sum()
     if with_delta:
         loss = loss + (total * gsum).sum()
@@ -306,4 +306,40 @@ def test_fused_training_step_matches_hf(tmp_path, padded):
     torch.testing.assert_close(loss, ref_loss, rtol=2e-3, atol=2e-3)
     for name, ref in ref_grads.items():
         rel = (grads[name] - ref).norm() / ref.norm().clamp(min=1e-12)
-        assert rel < 2e-2, f"{name}: relative gradient error {rel:.3e}"
+        assert rel < 5e-3, f"{name}: relative gradient error {rel:.3e}"  # another dropout draw: ~0.5
+
+
+def test_add_rmsnorm_lora_dropout_matches_pytorch():
+    from solution.norm import add_rmsnorm
+
+    torch.manual_seed(0)
+    batch, seq, hidden = 2, 30, 1536
+    mask = torch.ones(batch, seq, dtype=torch.long, device="cuda")
+    mask[1, 21:] = 0
+    pidx = mask.reshape(-1).nonzero().squeeze(1)
+    n = pidx.numel()
+    x = torch.randn(n, hidden, device="cuda", requires_grad=True)
+    delta = (torch.randn(n, hidden, device="cuda") * 3).half().requires_grad_(True)
+    weight = torch.rand(hidden, device="cuda") + 0.5
+    keep_q = torch.rand(batch * seq, hidden, device="cuda") > 0.05
+    keep_v = torch.rand(batch * seq, hidden, device="cuda") > 0.05
+    scale = 1.0 / (1.0 - 0.05)
+    g16, gq, gv = (torch.randn(n, hidden, device="cuda").half() for _ in range(3))
+    gsum = torch.randn(n, hidden, device="cuda")
+
+    total, y16, _, xq, xv = add_rmsnorm(x, delta, weight, 1e-6,
+                                        lora=(keep_q, keep_v, pidx, scale, scale))
+    ((y16.float() * g16.float()).sum() + (xq.float() * gq.float()).sum()
+     + (xv.float() * gv.float()).sum() + (total * gsum).sum()).backward()
+    ours = (x.grad.clone(), delta.grad.clone())
+    x.grad = delta.grad = None
+
+    ref_total, ref_y = _ref_norm(x, delta, weight, 1e-6)
+    ref_xq = torch.where(keep_q[pidx], ref_y * scale, 0.0)  # F.dropout's product, then autocast
+    ref_xv = torch.where(keep_v[pidx], ref_y * scale, 0.0)
+    ((ref_y * g16.float()).sum() + (ref_xq * gq.float()).sum() + (ref_xv * gv.float()).sum()
+     + (ref_total * gsum).sum()).backward()
+    torch.testing.assert_close(xq, ref_xq.half(), rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(xv, ref_xv.half(), rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(ours[0], x.grad, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(ours[1].float(), delta.grad.float(), rtol=2e-3, atol=2e-3)
