@@ -6,11 +6,9 @@ what each kernel does and where the ideas come from.
 
 from .integrate import patch_causal_lm, patch_setup, patch_sft_trainer
 from .swiglu import patch_qwen2_mlp
-from .warmup import start as start_warmup
 
 
 def apply():
-    start_warmup()        # (only with SOUPK_WARMUP=apply; by default it starts at model setup)
     patch_qwen2_mlp()     # the starter kit's example; kept, it does not count as ours
     patch_setup()         # fp16 tied embedding / head, fp32 embedding rows (our gather kernel)
     patch_causal_lm()     # fused decoder stack (decoder.py) + fused head and loss (lce.py)

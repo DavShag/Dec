@@ -21,24 +21,21 @@ goes away: the padding, fp32 copies of fp16 GEMM outputs, fp32 MLP intermediates
 each norm output, the separate elementwise kernels, and the saved tensors that came with them.
 """
 
-import contextlib
 import math
-import os
 
 import torch
 from torch.utils.checkpoint import checkpoint
 
 from .nf4 import NF4Weight, nf4_linear, nf4_supported
 from .norm import add_rmsnorm
-from .offload import Offloader
 from .rope import qkv_rope
 from .swiglu import swiglu
 
 PLAN_ATTR = "_soupk_plan"
 # Saved activations allowed per step; a step that would keep more recomputes its first layers.
-ACTIVATION_BUDGET_MB = float(os.environ.get("SOUPK_ACTIVATION_BUDGET_MB", "1300"))
-# Move MLP activations to pinned host memory (overlapped) before recomputing anything.
-OFFLOAD = os.environ.get("SOUPK_OFFLOAD", "0") == "1"
+# Chosen from a sweep on the T4 (2400 / 1400 / 900 / 500 MiB): at 1300 the largest batches give up
+# ~2-3% of speed for about a third less peak memory; lower budgets cost more speed than they save.
+ACTIVATION_BUDGET_MB = 1300
 
 
 def _base(module):
@@ -104,26 +101,18 @@ class ModelPlan:
         # inputs, two keep masks, q/k/v and the attention output in fp16, gate and up in fp16
         self.kept_per_token = 22 * hidden + 4 * inter
         self.recomputed_per_token = 6 * hidden  # a recomputed layer keeps only its inputs
-        self.offloaded_per_token = 4 * inter  # gate and up, when they go to host memory
 
-    def memory_plan(self, tokens):
-        """(recompute, offload): how many leading layers this step recomputes in backward, and
-        for how many of the following ones the MLP activations wait in host memory, to keep the
-        activations within the budget.
+    def recompute_count(self, tokens):
+        """How many leading layers this step recomputes in backward to stay within the budget.
 
-        The peak memory of the run is set by its largest batches, so only those pay; shorter
-        batches run without either."""
+        The peak memory of the run is set by its largest batches, so only those pay for
+        recomputation; shorter batches run without it."""
         layers = len(self.layers)
-        budget = ACTIVATION_BUDGET_MB * 2**20 / max(tokens, 1)  # bytes per token
-        save_recompute = self.kept_per_token - self.recomputed_per_token
-        save_offload = self.offloaded_per_token if OFFLOAD else 0
-        for recompute in range(layers + 1):
-            need = layers * self.kept_per_token - recompute * save_recompute - budget
-            if need <= 0:
-                return recompute, 0
-            if save_offload and need <= (layers - recompute) * save_offload:
-                return recompute, math.ceil(need / save_offload)
-        return layers, 0
+        excess = tokens * self.kept_per_token * layers - ACTIVATION_BUDGET_MB * 2**20
+        if excess <= 0:
+            return 0
+        saved_per_layer = tokens * (self.kept_per_token - self.recomputed_per_token)
+        return min(layers, math.ceil(excess / saved_per_layer))
 
     @staticmethod
     def supported(model):
@@ -205,7 +194,7 @@ def _attention(q, k, v, lengths, scaling):
     return torch.cat(rows) if len(rows) > 1 else rows[0]
 
 
-def _layer(plan, layer, x, pending, cos, sin, unpad, offloader=None):
+def _layer(plan, layer, x, pending, cos, sin, unpad):
     p_q, p_v = _dropout_p(layer.lora_q), _dropout_p(layer.lora_v)
     if p_q is not None and p_v is not None:
         # the q then v masks, in the base run's RNG order; the norm kernel applies them
@@ -229,9 +218,7 @@ def _layer(plan, layer, x, pending, cos, sin, unpad, offloader=None):
     residual, m16, _, _, _ = add_rmsnorm(residual, nf4_linear(attn, layer.o), layer.norm2.weight,
                                          plan.eps)
     gate, up = nf4_linear(m16, layer.gate_up)
-    with offloader.scope() if offloader is not None else contextlib.nullcontext():
-        hidden = swiglu(gate, up)  # it saves gate and up for backward
-    return residual, nf4_linear(hidden, layer.down)
+    return residual, nf4_linear(swiglu(gate, up), layer.down)
 
 
 def decoder_forward(model, plan, input_ids, attention_mask, position_ids):
@@ -247,8 +234,7 @@ def decoder_forward(model, plan, input_ids, attention_mask, position_ids):
     probe = torch.empty((batch, seq, 1), dtype=torch.float32, device=input_ids.device)
     cos, sin = model.rotary_emb(probe, position_ids)
     x, pending = model.embed_tokens(input_ids.reshape(-1).index_select(0, unpad.pidx)), None
-    recompute, offload = plan.memory_plan(unpad.pidx.numel())
-    offloader = Offloader(input_ids.device) if offload else None
+    recompute = plan.recompute_count(unpad.pidx.numel())
     for index, layer in enumerate(plan.layers):
         if index < recompute:
             # our own recomputation (allowed by the task; Soup's gradient_checkpointing stays off):
@@ -257,8 +243,7 @@ def decoder_forward(model, plan, input_ids, attention_mask, position_ids):
             x, pending = checkpoint(_layer, plan, layer, x, pending, cos, sin, unpad,
                                     use_reentrant=False, preserve_rng_state=True)
         else:
-            x, pending = _layer(plan, layer, x, pending, cos, sin, unpad,
-                                offloader if index < recompute + offload else None)
+            x, pending = _layer(plan, layer, x, pending, cos, sin, unpad)
     _, hidden, _, _, _ = add_rmsnorm(x, pending, plan.final_norm.weight, plan.eps)
     return hidden, unpad
 

@@ -101,7 +101,7 @@ def patch_setup():
         return
 
     def _setup_transformers(self, *args, **kwargs):
-        warmup.start("setup")
+        warmup.start()  # compile our kernels in the background while the model loads
         result = original(self, *args, **kwargs)
         prepare_model(getattr(self, "model", None))
         return result

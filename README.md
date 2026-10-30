@@ -109,6 +109,18 @@ enough of the first layers in backward (`torch.utils.checkpoint`, our own code: 
 `gradient_checkpointing` stays off). The RNG state is restored for the recomputation, so the
 recomputed layers draw the same dropout masks. Short batches pay nothing.
 
+How the budget was chosen (one Kaggle session, base 85.0 s / 14,345 MiB):
+
+| Activation budget | `soup train` | Peak GPU memory | Speed / memory vs base |
+|---|---|---|---|
+| 2400 MiB | 55.6 s | 4,055 MiB | 1.53x / 3.54x |
+| 1400 MiB | 57.0 s | 3,035 MiB | 1.49x / 4.73x |
+| 900 MiB | 60.6 s | 2,495 MiB | 1.40x / 5.75x |
+| 500 MiB | 64.5 s | 2,143 MiB | 1.32x / 6.69x |
+
+The score is logarithmic in both ratios, so from 2400 to ~1400 memory gains far outweigh the speed
+lost, and below that they stop doing so (unless the fastest team is above ~2x). We use 1300.
+
 ### 8. Compile warm-up (`warmup.py`)
 Every measured run starts with an empty Triton cache, and compilation counts. A background thread
 compiles every kernel variant (from dtypes alone, no GPU memory, `JITFunction.warmup`) while Soup
@@ -156,6 +168,12 @@ python harness/check_rules.py
   run draws; reproducing its Philox stream in Triton would remove it but is fragile.
 - Attention is PyTorch's memory-efficient SDPA per row; a varlen flash-attention kernel with GQA
   would avoid repeating k/v and the per-row launches.
+- We tried moving the MLP activations to pinned host memory on a side stream instead of
+  recomputing them (copies overlapped with the GEMMs, prefetched in backward). It saved ~2 s per
+  run but raised the nvidia-smi peak by up to 2 GiB: blocks freed across streams stay reserved by
+  PyTorch's caching allocator until the copies finish. We dropped it.
+- The T4 sessions differ: across our runs the base took 77-88 s and the speedup came out between
+  1.40x and 1.75x for the same code; the memory ratio is stable (the peak is deterministic).
 - The fused path supports exactly this setup (Qwen2, NF4 with double quantization, LoRA on q/v,
   right padding, CUDA); other configurations run the original code.
 

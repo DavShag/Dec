@@ -10,20 +10,13 @@ The arguments mirror the real launches (same dtypes, same integer divisibility, 
 launch options), or the compiled variant would not be the one training asks for.
 """
 
-import os
 import sys
 import threading
-import time
 
 import torch
 import triton
 
 GRID = (1,)
-# When to start: "setup" (when Soup starts loading the model: the main thread is then mostly in
-# I/O and CUDA, so compiling barely slows it; measured best on the T4) or "apply" (at once,
-# competing with Soup's imports for the GIL). SOUPK_WARMUP is a development switch.
-WHEN = os.environ.get("SOUPK_WARMUP", "setup")
-TIMES = []  # (perf_counter, event): when the thread started and finished, for the timeline tool
 _started = False
 
 
@@ -80,21 +73,22 @@ def _compile_all(dims):
         1.05, 1.05, 1, 0, 1, 1, 1, BLOCK_H=block_h, num_warps=8, grid=GRID)
 
 def _run():
-    TIMES.append((time.perf_counter(), "warmup start"))
     try:
         dims = _model_dims()
         if dims is not None:
             _compile_all(dims)
     except Exception:  # noqa: BLE001 - a warm-up failure only means compiling on first launch
         pass
-    TIMES.append((time.perf_counter(), "warmup end"))
 
 
-def start(when="apply"):
-    """Start compiling in the background, once, at the configured point (no-op outside
-    `soup train` or without CUDA)."""
+def start():
+    """Start compiling in the background, once (no-op outside `soup train` or without CUDA).
+
+    Called when Soup starts loading the model: the main thread is then mostly in I/O and CUDA, so
+    compiling barely slows it. Measured on the T4: starting earlier, in apply(), competes with
+    Soup's imports for the GIL and is no faster overall."""
     global _started
-    if _started or when != WHEN or not torch.cuda.is_available() or "--config" not in sys.argv:
+    if _started or not torch.cuda.is_available() or "--config" not in sys.argv:
         return None
     _started = True
     thread = threading.Thread(target=_run, name="soupk-triton-warmup", daemon=True)
