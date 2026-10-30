@@ -9,7 +9,8 @@ on the [n, hidden] rows of the n real tokens:
     qkv            = nf4_linear(h16, [Wq; Wk; Wv], bias)      nf4.py: one dequant launch, one GEMM
     lq, lv         = LoRA_B(LoRA_A(xq / xv)) * scaling        PEFT's modules, under autocast
     q, k, v        = qkv_rope(qkv, lq, lv, cos, sin)          rope.py: LoRA add, RoPE, GQA repeat
-    attn           = causal SDPA per row                      the padded, masked SDPA's result
+    attn           = causal SDPA per row                      the padded, masked SDPA's result;
+                                                              backward keeps k/v un-repeated
     s2, m16        = add_rmsnorm(s, nf4_linear(attn, Wo))
     gate, up       = nf4_linear(m16, [Wg; Wu])
     pending        = nf4_linear(swiglu(gate, up), Wd)         the residual add moves into the
@@ -36,6 +37,9 @@ PLAN_ATTR = "_soupk_plan"
 # Chosen from a sweep on the T4 (2400 / 1400 / 900 / 500 MiB): at 1300 the largest batches give up
 # ~2-3% of speed for about a third less peak memory; lower budgets cost more speed than they save.
 ACTIVATION_BUDGET_MB = 1300
+_ATEN = torch.ops.aten
+_EFFICIENT_ATTENTION = all(hasattr(_ATEN, name) for name in (
+    "_scaled_dot_product_efficient_attention", "_scaled_dot_product_efficient_attention_backward"))
 
 
 def _base(module):
@@ -97,9 +101,12 @@ class ModelPlan:
         self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // self.nq
         self.final_norm = model.norm
         hidden, inter = config.hidden_size, config.intermediate_size
+        q_size, kv_size = self.nq * self.head_dim, self.nkv * self.head_dim
         # bytes a layer keeps for backward per token: two fp32 norm inputs, two fp16 adapter
-        # inputs, two keep masks, q/k/v and the attention output in fp16, gate and up in fp16
-        self.kept_per_token = 22 * hidden + 4 * inter
+        # inputs and their keep masks packed 8 per byte, q, the distinct k/v heads and the
+        # attention output in fp16, gate and up in fp16
+        self.kept_per_token = (2 * 4 * hidden + 2 * 2 * hidden + 2 * hidden // 8
+                               + 2 * (2 * q_size + 2 * kv_size) + 2 * 2 * inter)
         self.recomputed_per_token = 6 * hidden  # a recomputed layer keeps only its inputs
 
     def recompute_count(self, tokens):
@@ -118,7 +125,8 @@ class ModelPlan:
     def supported(model):
         config = model.config
         head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-        return (config.hidden_act == "silu" and config.attention_dropout == 0.0
+        return (_EFFICIENT_ATTENTION and config.hidden_act == "silu"
+                and config.attention_dropout == 0.0 and config.hidden_size % 8 == 0
                 and head_dim in (64, 128) and config.num_attention_heads % config.num_key_value_heads == 0
                 and all(t == "full_attention" for t in config.layer_types)
                 and getattr(config, "_attn_implementation", "sdpa") == "sdpa"
@@ -183,15 +191,56 @@ def _lora_out(parts, x32, unpad):
     return lora_b(lora_a(dropped)) * scaling  # PEFT's own expression, under autocast
 
 
-def _attention(q, k, v, lengths, scaling):
-    """Causal SDPA per row on [n, heads, head_dim] rows; [n, heads * head_dim] out."""
-    rows = []
-    for qr, kr, vr in zip(q.split(lengths), k.split(lengths), v.split(lengths)):
-        out = torch.nn.functional.scaled_dot_product_attention(
-            qr.transpose(0, 1)[None], kr.transpose(0, 1)[None], vr.transpose(0, 1)[None],
-            dropout_p=0.0, scale=scaling, is_causal=qr.shape[0] > 1)
-        rows.append(out[0].transpose(0, 1).reshape(qr.shape[0], -1))
-    return torch.cat(rows) if len(rows) > 1 else rows[0]
+def _heads_first(rows):
+    """Token-major [L, heads, head_dim] rows as SDPA's [1, heads, L, head_dim] (a view)."""
+    return rows.transpose(0, 1)[None]
+
+
+class CausalAttention(torch.autograd.Function):
+    """Causal SDPA per row on [n, heads, head_dim] rows; [n, heads * head_dim] out.
+
+    The memory-efficient kernel that `scaled_dot_product_attention` runs on sm75, called directly,
+    row by row, with the same inputs: the same outputs and gradients. k and v come repeated to every
+    query head (rope.py; the kernel has no grouped-query mode). Backward keeps only their distinct
+    kv heads and repeats them again when it runs, so the k/v saved per token shrink by nq / nkv."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, lengths, scale, group):
+        outs, stats, start = [], [], 0
+        for length in lengths:
+            rows = slice(start, start + length)
+            out, lse, seed, offset = _ATEN._scaled_dot_product_efficient_attention(
+                _heads_first(q[rows]), _heads_first(k[rows]), _heads_first(v[rows]), None, True,
+                0.0, length > 1, scale=scale)
+            outs.append(out[0].transpose(0, 1).reshape(length, -1))
+            stats += [lse, seed, offset]
+            start += length
+        out = torch.cat(outs) if len(outs) > 1 else outs[0]
+        ctx.save_for_backward(q, k[:, ::group].contiguous(), v[:, ::group].contiguous(), out,
+                              *stats)
+        ctx.lengths, ctx.scale, ctx.group = lengths, scale, group
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        q, k_kv, v_kv, out, *stats = ctx.saved_tensors
+        k, v = (t.repeat_interleave(ctx.group, dim=1) for t in (k_kv, v_kv))
+        grad = grad.contiguous()
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        heads, head_dim = q.shape[1:]
+        start = 0
+        for index, length in enumerate(ctx.lengths):
+            rows = slice(start, start + length)
+            lse, seed, offset = stats[3 * index:3 * index + 3]
+            grads = _ATEN._scaled_dot_product_efficient_attention_backward(
+                _heads_first(grad[rows].view(length, heads, head_dim)), _heads_first(q[rows]),
+                _heads_first(k[rows]), _heads_first(v[rows]), None,
+                _heads_first(out[rows].view(length, heads, head_dim)), lse, seed, offset, 0.0,
+                [True, True, True, False], length > 1, scale=ctx.scale)
+            for target, part in zip((dq, dk, dv), grads):
+                target[rows] = part[0].transpose(0, 1)
+            start += length
+        return dq, dk, dv, None, None, None
 
 
 def _layer(plan, layer, x, pending, cos, sin, unpad):
@@ -214,7 +263,7 @@ def _layer(plan, layer, x, pending, cos, sin, unpad):
     qkv = nf4_linear(h16, layer.qkv, layer.qkv_bias)
     q, k, v = qkv_rope(qkv, lq, lv, cos, sin, unpad.pidx, unpad.seq, plan.nq, plan.nkv,
                        plan.head_dim)
-    attn = _attention(q, k, v, unpad.lengths, layer.scaling)
+    attn = CausalAttention.apply(q, k, v, unpad.lengths, layer.scaling, plan.nq // plan.nkv)
     residual, m16, _, _, _ = add_rmsnorm(residual, nf4_linear(attn, layer.o), layer.norm2.weight,
                                          plan.eps)
     gate, up = nf4_linear(m16, layer.gate_up)

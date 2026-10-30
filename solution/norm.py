@@ -7,7 +7,9 @@ PEFT runs dropout, a mask multiply and another cast for each LoRA adapter. One r
 the residual add (when given), the statistics and both multiplies stay in fp32 registers; the row is
 written once as fp16 for the GEMM and, for the adapters, once more per adapter as
 fp16(y * keep * 1/(1-p)), the exact value the dropout kernel and the autocast cast produce. The keep
-masks come from PyTorch's own dropout kernel, drawn in the base run's order (decoder.py).
+masks come from PyTorch's own dropout kernel, drawn in the base run's order (decoder.py), as bool
+tensors over the whole padded batch; the kernel also writes this row's two masks packed 8 per byte,
+and only those are kept for backward (H/4 bytes per token instead of 2H over every padded position).
 Backward recomputes x_hat from the saved fp32 input and the per-row 1/rms (Liger Kernel's RMSNorm
 derivation, Hsu et al. 2024): dx = rstd * (dy*w - x_hat * mean(dy*w * x_hat)), with dy the sum of
 the GEMM's gradient and both adapters' masked gradients.
@@ -22,8 +24,8 @@ import triton.language as tl
 # the same kernel: compilation happens inside the timed run, once per variant.
 @triton.jit(do_not_specialize=["has_delta", "write32", "lora"])
 def add_rmsnorm_fwd_kernel(x_ptr, delta_ptr, w_ptr, sum_ptr, y16_ptr, y32_ptr, rstd_ptr, kq_ptr,
-                           kv_ptr, pidx_ptr, xq_ptr, xv_ptr, H, eps, scale_q, scale_v, has_delta,
-                           write32, lora, BLOCK_H: tl.constexpr):
+                           kv_ptr, pidx_ptr, bits_ptr, xq_ptr, xv_ptr, H, eps, scale_q, scale_v,
+                           has_delta, write32, lora, BLOCK_H: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK_H)
     inside = cols < H
@@ -44,14 +46,22 @@ def add_rmsnorm_fwd_kernel(x_ptr, delta_ptr, w_ptr, sum_ptr, y16_ptr, y32_ptr, r
         keep_v = tl.load(kv_ptr + keep_row, mask=inside, other=0)
         tl.store(xv_ptr + row * H + cols, tl.where(keep_v, y * scale_v, 0.0).to(tl.float16),
                  mask=inside)
+        # both masks of this row for backward, 8 per byte (bit c % 8 of byte c // 8): q, then v
+        bit = 1 << (cols % 8)
+        packed_q = tl.sum(tl.reshape(keep_q.to(tl.int32) * bit, [BLOCK_H // 8, 8]), axis=1)
+        packed_v = tl.sum(tl.reshape(keep_v.to(tl.int32) * bit, [BLOCK_H // 8, 8]), axis=1)
+        nbytes = H // 8
+        byte = tl.arange(0, BLOCK_H // 8)
+        bits_row = bits_ptr + row * (2 * nbytes)
+        tl.store(bits_row + byte, packed_q.to(tl.uint8), mask=byte < nbytes)
+        tl.store(bits_row + nbytes + byte, packed_v.to(tl.uint8), mask=byte < nbytes)
     tl.store(rstd_ptr + row, rstd)
 
 
 @triton.jit(do_not_specialize=["has_gy16", "has_gy32", "has_gsum", "lora", "write_ddelta"])
 def add_rmsnorm_bwd_kernel(x_ptr, w_ptr, rstd_ptr, gy16_ptr, gy32_ptr, gsum_ptr, gq_ptr, gv_ptr,
-                           kq_ptr, kv_ptr, pidx_ptr, dx_ptr, ddelta_ptr, H, scale_q, scale_v,
-                           has_gy16, has_gy32, has_gsum, lora, write_ddelta,
-                           BLOCK_H: tl.constexpr):
+                           bits_ptr, dx_ptr, ddelta_ptr, H, scale_q, scale_v, has_gy16, has_gy32,
+                           has_gsum, lora, write_ddelta, BLOCK_H: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK_H)
     inside = cols < H
@@ -61,12 +71,17 @@ def add_rmsnorm_bwd_kernel(x_ptr, w_ptr, rstd_ptr, gy16_ptr, gy32_ptr, gsum_ptr,
         grad += tl.load(gy16_ptr + row * H + cols, mask=inside, other=0.0).to(tl.float32)
     if has_gy32:
         grad += tl.load(gy32_ptr + row * H + cols, mask=inside, other=0.0)
-    if lora:
-        keep_row = tl.load(pidx_ptr + row).to(tl.int64) * H + cols
+    if lora:  # the row's keep masks, as the forward kernel packed them
+        nbytes = H // 8
+        bits_row = bits_ptr + row * (2 * nbytes)
+        shift = cols % 8
+        keep_q = (tl.load(bits_row + cols // 8, mask=inside, other=0).to(tl.int32) >> shift) & 1
+        keep_v = (tl.load(bits_row + nbytes + cols // 8, mask=inside, other=0).to(tl.int32)
+                  >> shift) & 1
         g_q = tl.load(gq_ptr + row * H + cols, mask=inside, other=0.0).to(tl.float32)
-        grad += tl.where(tl.load(kq_ptr + keep_row, mask=inside, other=0), g_q * scale_q, 0.0)
+        grad += tl.where(keep_q != 0, g_q * scale_q, 0.0)
         g_v = tl.load(gv_ptr + row * H + cols, mask=inside, other=0.0).to(tl.float32)
-        grad += tl.where(tl.load(kv_ptr + keep_row, mask=inside, other=0), g_v * scale_v, 0.0)
+        grad += tl.where(keep_v != 0, g_v * scale_v, 0.0)
     grad = grad * tl.load(w_ptr + cols, mask=inside, other=0.0)
     dx = (grad - x_hat * (tl.sum(grad * x_hat, axis=0) / H)) * tl.load(rstd_ptr + row)
     if has_gsum:
@@ -92,7 +107,8 @@ class AddRMSNorm(torch.autograd.Function):
 
     delta may be None (then x itself is normalized and the sum output is None); y32 only with
     want32; xq16 / xv16 only with lora = (keep_q, keep_v, pidx, scale_q, scale_v), the dropped-out
-    fp16 inputs of the q and v adapters. The weight is frozen."""
+    fp16 inputs of the q and v adapters (keep masks [B*T, H] bool over the padded batch, pidx the
+    padded position of each row; H a multiple of 8). The weight is frozen."""
 
     @staticmethod
     def forward(ctx, x, delta, weight, eps, want32, lora):
@@ -107,18 +123,20 @@ class AddRMSNorm(torch.autograd.Function):
         hold = lambda dtype: _placeholder(dtype, x.device)  # noqa: E731
         keep_q, keep_v, pidx, scale_q, scale_v = lora if lora is not None else (
             hold(torch.bool), hold(torch.bool), hold(torch.int64), 1.0, 1.0)
+        bits = (torch.empty((rows, 2 * (hidden // 8)), dtype=torch.uint8, device=x.device)
+                if lora is not None else hold(torch.uint8))
         rstd = torch.empty(rows, dtype=torch.float32, device=x.device)
         add_rmsnorm_fwd_kernel[(rows,)](
             x, delta.contiguous() if delta is not None else hold(torch.float16), weight,
             total if total is not None else hold(torch.float32), y16,
-            y32 if want32 else hold(torch.float32), rstd, keep_q, keep_v, pidx,
+            y32 if want32 else hold(torch.float32), rstd, keep_q, keep_v, pidx, bits,
             xq if xq is not None else hold(torch.float16),
             xv if xv is not None else hold(torch.float16), hidden, eps, scale_q, scale_v,
             int(delta is not None), int(want32), int(lora is not None),
             BLOCK_H=triton.next_power_of_2(hidden), num_warps=8)
         saved = [total if total is not None else x, weight, rstd]
         if lora is not None:
-            saved += [keep_q, keep_v, pidx]
+            saved.append(bits)  # the padded masks themselves are not kept
             ctx.scales = (scale_q, scale_v)
         ctx.save_for_backward(*saved)
         ctx.has_delta, ctx.delta_dtype = delta is not None, getattr(delta, "dtype", None)
@@ -127,7 +145,7 @@ class AddRMSNorm(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, g_sum, g_y16, g_y32, g_xq, g_xv):
-        saved, weight, rstd, *keeps = ctx.saved_tensors
+        saved, weight, rstd, *packed = ctx.saved_tensors
         hidden = saved.shape[-1]
         rows = saved.numel() // hidden
         dx = torch.empty(saved.shape, dtype=torch.float32, device=saved.device)
@@ -141,19 +159,18 @@ class AddRMSNorm(torch.autograd.Function):
                 zeros = torch.zeros(saved.shape, dtype=torch.float16, device=saved.device)
             g_xq = g_xq.contiguous() if g_xq is not None else zeros
             g_xv = g_xv.contiguous() if g_xv is not None else zeros
-            keep_q, keep_v, pidx = keeps
+            (bits,) = packed
             scale_q, scale_v = ctx.scales
         else:
             g_xq = g_xv = hold(torch.float16)
-            keep_q = keep_v = hold(torch.bool)
-            pidx, scale_q, scale_v = hold(torch.int64), 1.0, 1.0
+            bits, scale_q, scale_v = hold(torch.uint8), 1.0, 1.0
         add_rmsnorm_bwd_kernel[(rows,)](
             saved, weight, rstd,
             g_y16.to(torch.float16).contiguous() if g_y16 is not None else hold(torch.float16),
             g_y32.contiguous() if g_y32 is not None else hold(torch.float32),
-            g_sum.contiguous() if g_sum is not None else hold(torch.float32), g_xq, g_xv, keep_q,
-            keep_v, pidx, dx, ddelta if write_dd else hold(torch.float16), hidden, scale_q,
-            scale_v, int(g_y16 is not None), int(g_y32 is not None), int(g_sum is not None),
+            g_sum.contiguous() if g_sum is not None else hold(torch.float32), g_xq, g_xv, bits,
+            dx, ddelta if write_dd else hold(torch.float16), hidden, scale_q, scale_v,
+            int(g_y16 is not None), int(g_y32 is not None), int(g_sum is not None),
             int(use_lora), int(write_dd), BLOCK_H=triton.next_power_of_2(hidden), num_warps=8)
         grad_x = dx if ctx.x_dtype == torch.float32 else dx.to(ctx.x_dtype)
         if not ctx.has_delta:

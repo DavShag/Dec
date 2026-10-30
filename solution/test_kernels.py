@@ -240,6 +240,41 @@ def test_qkv_rope_matches_pytorch(padded):
         torch.testing.assert_close(o.float(), t.grad.float(), rtol=2e-3, atol=2e-3)
 
 
+def test_causal_attention_matches_sdpa():
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    from solution.decoder import CausalAttention
+
+    torch.manual_seed(0)
+    lengths, nq, nkv, d = [37, 1, 20], 12, 2, 128
+    n, group, scale = sum(lengths), nq // nkv, d ** -0.5
+    q = torch.randn(n, nq, d, device="cuda").half().requires_grad_()
+    k = torch.randn(n, nkv, d, device="cuda").half().repeat_interleave(group, 1).requires_grad_()
+    v = torch.randn(n, nkv, d, device="cuda").half().repeat_interleave(group, 1).requires_grad_()
+    grad = torch.randn(n, nq * d, device="cuda").half()
+
+    out = CausalAttention.apply(q, k, v, lengths, scale, group)
+    _, k_kept, v_kept, *_ = out.grad_fn.saved_tensors
+    assert k_kept.shape == v_kept.shape == (n, nkv, d)  # k/v kept un-repeated for backward
+    out.backward(grad)
+    ours = [out.detach()] + [t.grad.clone() for t in (q, k, v)]
+    for t in (q, k, v):
+        t.grad = None
+
+    rows = []  # the SDPA call per row it replaces, on the kernel SDPA picks on a T4
+    with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+        for qr, kr, vr in zip(q.split(lengths), k.split(lengths), v.split(lengths)):
+            o = torch.nn.functional.scaled_dot_product_attention(
+                qr.transpose(0, 1)[None], kr.transpose(0, 1)[None], vr.transpose(0, 1)[None],
+                scale=scale, is_causal=qr.shape[0] > 1)
+            rows.append(o[0].transpose(0, 1).reshape(qr.shape[0], -1))
+    ref = torch.cat(rows)
+    ref.backward(grad)
+    assert torch.equal(ours[0], ref.detach())
+    for ours_grad, t in zip(ours[1:], (q, k, v)):  # dq: the kernel's backward is not bitwise
+        torch.testing.assert_close(ours_grad, t.grad, rtol=1e-3, atol=1e-3)  # deterministic
+
+
 def _tiny_qlora(tmp_path):
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
     from transformers import (AutoModelForCausalLM, BitsAndBytesConfig, Qwen2Config,
@@ -346,3 +381,38 @@ def test_add_rmsnorm_lora_dropout_matches_pytorch():
     torch.testing.assert_close(xv, ref_xv.half(), rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(ours[0], x.grad, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(ours[1].float(), delta.grad.float(), rtol=2e-3, atol=2e-3)
+
+
+def test_warmup_compiles_what_training_launches(tmp_path):
+    """Every kernel variant a training step launches is one the warm-up thread compiled: a stale
+    argument list in warmup.py would otherwise compile inside the measured steps, silently."""
+    import solution
+    from solution import integrate, lce, nf4, norm, rope, swiglu, warmup
+    from solution.integrate import prepare_model
+
+    kernels = (integrate.embed_fp32_kernel, norm.add_rmsnorm_fwd_kernel,
+               norm.add_rmsnorm_bwd_kernel, nf4.nf4_dequant_kernel, rope.qkv_rope_fwd_kernel,
+               rope.qkv_rope_bwd_kernel, lce.lce_row_kernel, swiglu.example_swiglu_fwd_kernel,
+               swiglu.example_swiglu_bwd_kernel)
+    device = torch.cuda.current_device()
+
+    def compiled():
+        try:
+            return {k.fn.__name__: set(k.device_caches[device][0]) for k in kernels}
+        except (AttributeError, IndexError, KeyError, TypeError):
+            pytest.skip("this Triton keeps its compiled kernels elsewhere")
+
+    solution.apply()
+    model = _tiny_qlora(tmp_path)
+    assert prepare_model(model)
+    for kernel in kernels:  # forget what earlier tests compiled: only the warm-up's variants
+        kernel.device_caches.clear()
+    warmup._compile_all((256, 1024, 4, 2, 64))  # _tiny_qlora's hidden, vocab, heads, head_dim
+    before = compiled()
+    ids = torch.randint(0, 1024, (3, 40), generator=torch.Generator().manual_seed(1)).cuda()
+    mask = torch.ones_like(ids)
+    mask[1, 31:] = 0
+    labels = ids.masked_fill(mask == 0, -100)
+    _train_step(model, {"input_ids": ids, "attention_mask": mask, "labels": labels,
+                        "use_cache": False}, seed=3)
+    assert compiled() == before

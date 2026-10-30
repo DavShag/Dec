@@ -82,8 +82,10 @@ output for the q|k|v (or gate|up) GEMM, and the two adapters' inputs fp16(y × k
 the exact value PEFT's dropout plus autocast's cast produce. The keep masks come from PyTorch's own
 dropout kernel, drawn on a tensor of the same shape and dtype as in the base run and in the same
 order, so they are the same masks (verified: the gradients match the HF/PEFT step to 1e-3, while a
-different dropout draw moves them by ~50%). Backward rebuilds x̂ from the saved fp32 input and
-1/rms and adds both adapters' masked gradients in fp32.
+different dropout draw moves them by ~50%). The kernel also packs the row's two masks 8 per byte,
+and only those are kept for backward: 384 bytes per real token and layer instead of two bool masks
+over every padded position (~5 KB per token at this task's 43% padding). Backward rebuilds x̂ from
+the saved fp32 input and 1/rms and adds both adapters' masked gradients in fp32.
 *Derivation:* Liger Kernel's RMSNorm backward (Hsu et al. 2024).
 
 ### 5. q/k/v epilogue (`rope.py`, `qkv_rope_fwd_kernel` / `_bwd_kernel`)
@@ -99,7 +101,10 @@ one fp16 gradient row whose q and v parts are also the LoRA outputs' gradients.
 TRL pads each batch to its longest row). Every op except attention runs on the real tokens only;
 attention runs per row with `is_causal`, which for right padding is exactly what the padded,
 masked SDPA of the base run computes for the real tokens, and lets the memory-efficient kernel
-skip everything above the diagonal. Rows of different batches are never mixed.
+skip everything above the diagonal. We call that kernel directly (it is the one SDPA picks on
+sm75, so outputs and gradients are the same): k and v reach it repeated to all 12 query heads, but
+backward keeps only the 2 distinct kv heads and repeats them again when it runs, 1 KB instead of
+6 KB per token and layer. Rows of different batches are never mixed.
 *Idea:* the varlen interface of FlashAttention-2 (Dao 2023).
 
 ### 7. Adaptive recomputation (`decoder.py`)
@@ -126,16 +131,34 @@ Every measured run starts with an empty Triton cache, and compilation counts. A 
 compiles every kernel variant (from dtypes alone, no GPU memory, `JITFunction.warmup`) while Soup
 loads the model; all flags are runtime arguments so each kernel compiles exactly once.
 
+### 9. Startup (`startup.py`)
+Not kernels, but inside the measured command: three costs of the start of `soup train`, removed
+without changing any value the run produces.
+- `datasets` fingerprints each `Dataset.map` by pickling the mapped function with dill. Soup's
+  formatting function holds the tokenizer, so this pickled its 151k-entry vocabulary: ~1.7 s of a
+  1.85 s map (cProfile, our machine), the tokenization itself was 0.2 s. The dataset lives in
+  memory, so the fingerprint names a cache file that is never written; we pass a random one, which
+  is what `datasets` does itself for a function it cannot hash.
+- transformers loads each checkpoint tensor with one `.to(device, dtype)`, and for a CPU tensor
+  PyTorch converts bf16 to fp16 on the CPU before the copy. We copy first and convert on the GPU:
+  the same IEEE conversion, and the loaded 4-bit model is bit-identical (a digest of every packed
+  weight, absmax and table). `from_pretrained`: 2.4–3.6 s → 1.1 s on our machine.
+- bitsandbytes rebuilt its 16-entry NF4 table, with a host-to-device copy, for each of the 196
+  linears it quantizes; we build it once.
+
 Kept from the starter kit: the example SwiGLU kernel (`swiglu.py`), now on fp16 MLP activations;
 it does not count toward our share.
 
 ## How we checked it
 
-- `python -m pytest solution -q` (17 tests, on a GPU): each kernel against plain PyTorch, forward
+- `python -m pytest solution -q` (21 tests, on a GPU): each kernel against plain PyTorch, forward
   and backward (NF4 bit-exact vs bitsandbytes; norm, RoPE epilogue, fused head with padding, real
-  vocabulary and the fp16 loss scale), plus whole training steps of a small 4-bit Qwen2 with PEFT
-  LoRA against transformers + peft + bitsandbytes (padded / unpadded / recomputed): loss within
-  2e-6 relative, LoRA gradients within 5e-3.
+  vocabulary and the fp16 loss scale; attention against the SDPA call it replaces), plus whole
+  training steps of a small 4-bit Qwen2 with PEFT LoRA against transformers + peft + bitsandbytes
+  (padded / unpadded / recomputed): loss within 2e-6 relative, LoRA gradients within 5e-3; and a
+  check that the warm-up compiles exactly the kernel variants a training step launches; the
+  startup patches: bf16 → fp16 on the GPU is bitwise the CPU conversion (edge values included), and
+  an in-memory map gives the same rows without hashing its function.
 - `SOUP_APPLY_SOLUTION=1 python -m pytest tests -q`: Soup's 79 tests with our patches.
 - `harness/run_task.py` + `harness/check_rules.py` on a Kaggle T4: all 10 checks.
 
@@ -158,9 +181,10 @@ python harness/check_rules.py
 
 ## Limitations and what we would do next
 
-- About 20 s of the ~54.8 s are not training: Python imports, model loading and
-  quantization, the trainer's setup, saving. They are the same for the base run, so they cap the
-  speedup; we did not touch Soup's loading path.
+- About 20 s of the ~54.8 s were not training: Python imports, model loading and
+  quantization, the trainer's setup, saving. `startup.py` removes the avoidable part of loading and
+  of the dataset preparation; the imports (~5 s) and the rest are the same as in the base run and
+  cap the speedup.
 - The GEMMs (cuBLAS, ~26 TFLOPS on the T4) are now ~65% of a step. A fused W4A16 GEMM in Triton
   would remove the dequantization pass (~10% of a step) but has to match cuBLAS on Turing's
   tensor cores to pay off; we did not get there.
@@ -187,7 +211,8 @@ python harness/check_rules.py
 | `solution/lce.py` | fused head + loss + metrics |
 | `solution/nf4.py`, `norm.py`, `rope.py` | dequantization, add+RMSNorm+dropout, q/k/v epilogue |
 | `solution/warmup.py` | background compilation |
+| `solution/startup.py` | startup: dataset map without the tokenizer pickle, bf16 → fp16 on the GPU while loading, one NF4 table |
 | `solution/swiglu.py` | the starter kit's example kernel (unchanged) |
-| `solution/test_kernels.py` | tests |
+| `solution/test_kernels.py`, `solution/test_startup.py` | tests |
 
 Everything else (`harness/`, `tests/`, `task/`, `templates/`) is the starter kit, unchanged.
