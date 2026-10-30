@@ -20,10 +20,26 @@ import triton.language as tl
 BLOCK_BYTES = 1024
 
 
-@triton.jit
-def _dequant_block(packed_ptr, absmax_ptr, absmax2_ptr, code2_ptr, code_ptr, out_ptr, offset,
-                   n_bytes, blk, BLOCK: tl.constexpr):
-    """BLOCK packed bytes of one weight -> 2 * BLOCK fp16 weights."""
+@triton.jit(do_not_specialize=["blocks0", "blocks1"])  # n_i stay specialized (multiples
+# of 16): the masks then vectorize; every real weight has the same divisibility, so one variant
+def nf4_dequant_kernel(p0, a0, b0, c0, k0, o0, off0, n0, p1, a1, b1, c1, k1, o1, off1, n1,
+                       p2, a2, b2, c2, k2, o2, off2, n2, blocks0, blocks1, BLOCK: tl.constexpr):
+    """Up to three weights (q|k|v, gate|up, or one) in one launch: the first blocks0 programs
+    dequantize weight 0, the next blocks1 weight 1, the rest weight 2; each program turns BLOCK
+    packed bytes into 2 * BLOCK fp16 weights. One launch per group keeps the per-launch CPU cost
+    (Python launcher, harness timing) off the critical path."""
+    pid = tl.program_id(0)
+    first, second = pid < blocks0, pid < blocks0 + blocks1
+    packed_ptr = tl.where(first, p0, tl.where(second, p1, p2))
+    absmax_ptr = tl.where(first, a0, tl.where(second, a1, a2))
+    absmax2_ptr = tl.where(first, b0, tl.where(second, b1, b2))
+    code2_ptr = tl.where(first, c0, tl.where(second, c1, c2))
+    code_ptr = tl.where(first, k0, tl.where(second, k1, k2))
+    out_ptr = tl.where(first, o0, tl.where(second, o1, o2))
+    offset = tl.where(first, off0, tl.where(second, off1, off2))
+    n_bytes = tl.where(first, n0, tl.where(second, n1, n2))
+    blk = tl.where(first, pid, tl.where(second, pid - blocks0, pid - blocks0 - blocks1))
+
     byte = blk * BLOCK + tl.arange(0, BLOCK)
     inside = byte < n_bytes
     packed = tl.load(packed_ptr + byte, mask=inside, other=0).to(tl.int32)
@@ -36,21 +52,6 @@ def _dequant_block(packed_ptr, absmax_ptr, absmax2_ptr, code2_ptr, code_ptr, out
     pairs = tl.reshape(tl.join(high, low), [2 * BLOCK])
     pos = blk * (2 * BLOCK) + tl.arange(0, 2 * BLOCK)
     tl.store(out_ptr + pos, pairs.to(tl.float16), mask=pos < 2 * n_bytes)
-
-
-@triton.jit(do_not_specialize=["n0", "n1", "n2", "blocks0", "blocks1"])
-def nf4_dequant_kernel(p0, a0, b0, c0, k0, o0, off0, n0, p1, a1, b1, c1, k1, o1, off1, n1,
-                       p2, a2, b2, c2, k2, o2, off2, n2, blocks0, blocks1, BLOCK: tl.constexpr):
-    """Up to three weights (q|k|v, gate|up, or one) in one launch: the first blocks0 programs
-    dequantize weight 0, the next blocks1 weight 1, the rest weight 2. One launch per group keeps
-    the per-launch CPU cost (Python launcher, harness timing) off the critical path."""
-    pid = tl.program_id(0)
-    if pid < blocks0:
-        _dequant_block(p0, a0, b0, c0, k0, o0, off0, n0, pid, BLOCK)
-    elif pid < blocks0 + blocks1:
-        _dequant_block(p1, a1, b1, c1, k1, o1, off1, n1, pid - blocks0, BLOCK)
-    else:
-        _dequant_block(p2, a2, b2, c2, k2, o2, off2, n2, pid - blocks0 - blocks1, BLOCK)
 
 
 class NF4Weight:
