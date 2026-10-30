@@ -23,6 +23,7 @@ import torch
 import triton
 import triton.language as tl
 
+from .decoder import prepare_decoder
 from .lce import fused_linear_cross_entropy
 
 FUSED_ATTR = "_soupk_fused_head"
@@ -87,6 +88,7 @@ def prepare_model(model):
     if head.weight.dtype == torch.float32:  # not tied: the head alone
         head.weight.data = head.weight.data.to(torch.float16).contiguous()
     setattr(causal, FUSED_ATTR, True)
+    prepare_decoder(causal.model)
     return True
 
 

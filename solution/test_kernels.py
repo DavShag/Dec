@@ -119,3 +119,181 @@ def test_embedding_fp32_rows():
     out = embed(ids)
     assert out.dtype == torch.float32 and out.shape == (3, 129, HIDDEN)
     torch.testing.assert_close(out, embed.weight.float()[ids], rtol=0, atol=0)
+
+
+def test_nf4_dequant_matches_bitsandbytes():
+    import bitsandbytes.functional as bnbf
+
+    from solution.nf4 import NF4Weight, dequantize_stack
+
+    class Param:
+        pass
+
+    torch.manual_seed(0)
+    parts = []
+    for rows, cols in ((256, 1536), (512, 1536), (64, 1536)):
+        w = torch.randn(rows, cols, dtype=torch.float16, device="cuda")
+        packed, state = bnbf.quantize_4bit(w, blocksize=64, compress_statistics=True,
+                                           quant_type="nf4")
+        param = Param()
+        param.data, param.quant_state = packed, state
+        parts.append((NF4Weight(param), bnbf.dequantize_4bit(packed, state)))
+    ours = dequantize_stack([p for p, _ in parts])
+    torch.testing.assert_close(ours, torch.cat([ref for _, ref in parts]), rtol=0, atol=0)
+
+
+def _ref_norm(x, delta, weight, eps):
+    total = x + delta.float() if delta is not None else x
+    var = total.pow(2).mean(-1, keepdim=True)
+    return total, weight * (total * torch.rsqrt(var + eps))
+
+
+@pytest.mark.parametrize("with_delta", [False, True])
+def test_add_rmsnorm_matches_pytorch(with_delta):
+    from solution.norm import add_rmsnorm
+
+    torch.manual_seed(0)
+    x = torch.randn(3, 37, 1536, device="cuda", requires_grad=True)
+    delta = (torch.randn(3, 37, 1536, device="cuda") * 3).half().requires_grad_(True) \
+        if with_delta else None
+    weight = torch.rand(1536, device="cuda") + 0.5
+    g16 = torch.randn(3, 37, 1536, device="cuda").half()
+    g32 = torch.randn(3, 37, 1536, device="cuda")
+    gsum = torch.randn(3, 37, 1536, device="cuda")
+
+    total, y16, y32 = add_rmsnorm(x, delta, weight, 1e-6, want32=True)
+    loss = (y16.float() * g16.float()).sum() + (y32 * g32).sum()
+    if with_delta:
+        loss = loss + (total * gsum).sum()
+    loss.backward()
+    ours = [x.grad.clone()] + ([delta.grad.clone()] if with_delta else [])
+    x.grad = None
+    if with_delta:
+        delta.grad = None
+
+    ref_total, ref_y = _ref_norm(x, delta, weight, 1e-6)
+    ref_loss = (ref_y * g16.float()).sum() + (ref_y * g32).sum()
+    if with_delta:
+        ref_loss = ref_loss + (ref_total * gsum).sum()
+    ref_loss.backward()
+    torch.testing.assert_close(y32, ref_y, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(y16, ref_y.half(), rtol=1e-3, atol=1e-3)
+    if with_delta:
+        torch.testing.assert_close(total, ref_total, rtol=0, atol=0)
+    torch.testing.assert_close(ours[0], x.grad, rtol=1e-4, atol=1e-4)
+    if with_delta:
+        torch.testing.assert_close(ours[1].float(), delta.grad.float(), rtol=2e-3, atol=2e-3)
+
+
+def _ref_qkv(qkv, lq, lv, cos, sin, nq, nkv, rep, d):
+    from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+
+    batch, seq, _ = qkv.shape
+    q = qkv[..., :nq * d].float() + lq.float()
+    k = qkv[..., nq * d:(nq + nkv) * d].float()
+    v = qkv[..., (nq + nkv) * d:].float() + lv.float()
+    q = q.view(batch, seq, nq, d).transpose(1, 2)
+    k = k.view(batch, seq, nkv, d).transpose(1, 2)
+    v = v.view(batch, seq, nkv, d).transpose(1, 2)
+    q, k = apply_rotary_pos_emb(q, k, cos, sin)
+    k = k[:, :, None].expand(batch, nkv, rep, seq, d).reshape(batch, nkv * rep, seq, d)
+    v = v[:, :, None].expand(batch, nkv, rep, seq, d).reshape(batch, nkv * rep, seq, d)
+    return q.half(), k.half(), v.half()
+
+
+@pytest.mark.parametrize("rep", [6, 1])
+def test_qkv_rope_matches_pytorch(rep):
+    from solution.rope import qkv_rope
+
+    torch.manual_seed(0)
+    batch, seq, nq, nkv, d = 2, 45, 12, 2, 128
+    qkv = (torch.randn(batch, seq, (nq + 2 * nkv) * d, device="cuda") * 2).half().requires_grad_()
+    lq = (torch.randn(batch, seq, nq * d, device="cuda") * 0.1).half().requires_grad_()
+    lv = (torch.randn(batch, seq, nkv * d, device="cuda") * 0.1).half().requires_grad_()
+    pos = torch.arange(seq, device="cuda").float()
+    inv = 1.0 / (1e6 ** (torch.arange(0, d, 2, device="cuda").float() / d))
+    emb = torch.cat([pos[:, None] * inv[None], pos[:, None] * inv[None]], -1)[None]
+    cos, sin = emb.cos(), emb.sin()
+    grads = [torch.randn(batch, h, seq, d, device="cuda").half() for h in (nq, nkv * rep, nkv * rep)]
+
+    outs = qkv_rope(qkv, lq, lv, cos, sin, nq, nkv, rep, d)
+    sum(((o.float() * g.float()).sum() for o, g in zip(outs, grads))).backward()
+    ours = [t.grad.clone() for t in (qkv, lq, lv)]
+    for t in (qkv, lq, lv):
+        t.grad = None
+    refs = _ref_qkv(qkv, lq, lv, cos, sin, nq, nkv, rep, d)
+    sum(((o.float() * g.float()).sum() for o, g in zip(refs, grads))).backward()
+    for o, r in zip(outs, refs):
+        torch.testing.assert_close(o, r, rtol=1e-3, atol=1e-3)
+    assert outs[0].stride() == refs[0].stride() or outs[0].transpose(1, 2).is_contiguous()
+    for o, t in zip(ours, (qkv, lq, lv)):
+        torch.testing.assert_close(o.float(), t.grad.float(), rtol=2e-3, atol=2e-3)
+
+
+def _tiny_qlora(tmp_path):
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from transformers import (AutoModelForCausalLM, BitsAndBytesConfig, Qwen2Config,
+                              Qwen2ForCausalLM)
+
+    torch.manual_seed(0)
+    config = Qwen2Config(vocab_size=1024, hidden_size=256, intermediate_size=640,
+                         num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+                         max_position_embeddings=256, tie_word_embeddings=True,
+                         rms_norm_eps=1e-6, attn_implementation="sdpa")
+    Qwen2ForCausalLM(config).half().save_pretrained(tmp_path)
+    quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                               bnb_4bit_use_double_quant=True,
+                               bnb_4bit_compute_dtype=torch.float16)
+    model = AutoModelForCausalLM.from_pretrained(tmp_path, quantization_config=quant,
+                                                 dtype=torch.float16, device_map={"": 0},
+                                                 attn_implementation="sdpa")
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+    model = get_peft_model(model, LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05,
+                                             target_modules=["q_proj", "v_proj"],
+                                             task_type="CAUSAL_LM"))
+    for name, param in model.named_parameters():
+        if "lora_B" in name:
+            torch.nn.init.normal_(param, std=0.05)
+    model.train()
+    return model
+
+
+def _train_step(model, batch, seed):
+    torch.manual_seed(seed)
+    with torch.autocast("cuda", dtype=torch.float16):
+        out = model(**batch)
+    (out.loss * 1024.0).backward()
+    grads = {n: p.grad.detach().clone() / 1024.0 for n, p in model.named_parameters()
+             if p.requires_grad}
+    model.zero_grad(set_to_none=True)
+    return out.loss.detach(), grads
+
+
+@pytest.mark.parametrize("padded", [True, False])
+def test_fused_training_step_matches_hf(tmp_path, padded):
+    import solution
+    from solution.integrate import prepare_model
+
+    solution.apply()
+    model = _tiny_qlora(tmp_path)
+    gen = torch.Generator().manual_seed(1)
+    ids = torch.randint(0, 1024, (3, 40), generator=gen).cuda()
+    mask = torch.ones_like(ids)
+    labels = ids.clone()
+    labels[:, :6] = -100
+    if padded:
+        for row, length in ((1, 31), (2, 17)):
+            mask[row, length:] = 0
+            labels[row, length:] = -100
+    batch = {"input_ids": ids, "attention_mask": mask, "labels": labels, "use_cache": False}
+
+    ref_loss, ref_grads = _train_step(model, batch, seed=3)
+    assert prepare_model(model)
+    from solution.decoder import PLAN_ATTR
+
+    assert getattr(model.get_base_model().model, PLAN_ATTR, None) is not None
+    loss, grads = _train_step(model, batch, seed=3)
+    torch.testing.assert_close(loss, ref_loss, rtol=2e-3, atol=2e-3)
+    for name, ref in ref_grads.items():
+        rel = (grads[name] - ref).norm() / ref.norm().clamp(min=1e-12)
+        assert rel < 2e-2, f"{name}: relative gradient error {rel:.3e}"
