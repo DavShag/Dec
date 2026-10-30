@@ -1,21 +1,23 @@
-"""The Qwen2 decoder stack of a training forward, built from our kernels.
+"""The Qwen2 decoder stack of a training forward, built from our kernels, on the real tokens only.
 
 Per layer, the base run is HF's Qwen2DecoderLayer with bitsandbytes 4-bit linears and PEFT LoRA on
-q_proj / v_proj, everything around the GEMMs in separate fp32 kernels. Here:
+q_proj / v_proj, on the padded batch, everything around the GEMMs in separate fp32 kernels. Here,
+on the [n, hidden] rows of the n real tokens:
 
-    s, h16, h32 = add_rmsnorm(residual, pending)            norm.py: add + RMSNorm, fp16 out
-    qkv         = nf4_linear(h16, [Wq; Wk; Wv], bias)       nf4.py: one dequant pass, one GEMM
-    lq, lv      = LoRA_B(LoRA_A(dropout(h32))) * scaling    PEFT's modules, same RNG calls
-    q, k, v     = qkv_rope(qkv, lq, lv, cos, sin)           rope.py: LoRA add, RoPE, layouts
-    attn        = SDPA(q, k, v, mask)                       as transformers calls it
-    s2, m16     = add_rmsnorm(s, nf4_linear(attn, Wo))
-    gate, up    = nf4_linear(m16, [Wg; Wu])
-    pending     = nf4_linear(swiglu(gate, up), Wd)          the residual add moves into the
-                                                            next layer's norm
+    keep_q, keep_v = dropout masks                        PyTorch's own kernel, base run's RNG order
+    s, h16, xq, xv = add_rmsnorm(residual, pending, keeps)    norm.py: add + RMSNorm + dropout
+    qkv            = nf4_linear(h16, [Wq; Wk; Wv], bias)      nf4.py: one dequant launch, one GEMM
+    lq, lv         = LoRA_B(LoRA_A(xq / xv)) * scaling        PEFT's modules, under autocast
+    q, k, v        = qkv_rope(qkv, lq, lv, cos, sin)          rope.py: LoRA add, RoPE, GQA repeat
+    attn           = causal SDPA per row                      the padded, masked SDPA's result
+    s2, m16        = add_rmsnorm(s, nf4_linear(attn, Wo))
+    gate, up       = nf4_linear(m16, [Wg; Wu])
+    pending        = nf4_linear(swiglu(gate, up), Wd)         the residual add moves into the
+                                                              next layer's norm kernel
 What stays the same as the base: the 4-bit weights and their values, every fp16 rounding point in
 front of a GEMM, fp32 for the residual stream, norm statistics, RoPE and LoRA adds, the dropout
-calls (same shapes, dtype and order, so the same masks), the mask, the SDPA call and the layouts
-it sees. What goes away: fp32 copies of fp16 GEMM outputs, fp32 MLP intermediates, three casts of
+masks (same kernel, shape, dtype and order of draws) and the attention each real token sees. What
+goes away: the padding, fp32 copies of fp16 GEMM outputs, fp32 MLP intermediates, three casts of
 each norm output, the separate elementwise kernels, and the saved tensors that came with them.
 """
 
