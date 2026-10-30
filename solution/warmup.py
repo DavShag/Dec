@@ -19,9 +19,10 @@ import torch
 import triton
 
 GRID = (1,)
-# When to start: "apply" (as soon as apply() runs, overlapping Soup's imports) or "setup" (when Soup
-# starts loading the model). SOUPK_WARMUP is a development switch for measuring the two.
-WHEN = os.environ.get("SOUPK_WARMUP", "apply")
+# When to start: "setup" (when Soup starts loading the model: the main thread is then mostly in
+# I/O and CUDA, so compiling barely slows it; measured best on the T4) or "apply" (at once,
+# competing with Soup's imports for the GIL). SOUPK_WARMUP is a development switch.
+WHEN = os.environ.get("SOUPK_WARMUP", "setup")
 TIMES = []  # (perf_counter, event): when the thread started and finished, for the timeline tool
 _started = False
 

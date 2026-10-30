@@ -32,7 +32,7 @@ from .swiglu import swiglu
 
 PLAN_ATTR = "_soupk_plan"
 # Saved activations allowed per step; a step that would keep more recomputes its first layers.
-ACTIVATION_BUDGET_MB = float(os.environ.get("SOUPK_ACTIVATION_BUDGET_MB", "1000"))
+ACTIVATION_BUDGET_MB = float(os.environ.get("SOUPK_ACTIVATION_BUDGET_MB", "1300"))
 
 
 def _base(module):
