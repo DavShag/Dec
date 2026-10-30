@@ -16,7 +16,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T"])  # T varies per batch: one compile
 def qkv_rope_fwd_kernel(qkv_ptr, lq_ptr, lv_ptr, cos_ptr, sin_ptr, q_ptr, k_ptr, v_ptr, comp_ptr,
                         T, cos_sb, q_sb, q_sh, q_st, kv_sb, kv_sh, kv_st,
                         NQ: tl.constexpr, NKV: tl.constexpr, REP: tl.constexpr, D: tl.constexpr,
@@ -64,7 +64,7 @@ def qkv_rope_fwd_kernel(qkv_ptr, lq_ptr, lv_ptr, cos_ptr, sin_ptr, q_ptr, k_ptr,
     tl.store(v_ptr + b * kv_sb + h * kv_sh + t * kv_st + d, v.to(tl.float16), mask=out_kv)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def qkv_rope_bwd_kernel(dq_ptr, dk_ptr, dv_ptr, cos_ptr, sin_ptr, dqkv_ptr, pidx_ptr, T, cos_sb,
                         dq_sb, dq_sh, dq_st, dk_sb, dk_sh, dk_st, dv_sb, dv_sh, dv_st,
                         NQ: tl.constexpr, NKV: tl.constexpr, REP: tl.constexpr, D: tl.constexpr,
