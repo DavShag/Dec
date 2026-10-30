@@ -279,13 +279,18 @@ def _train_step(model, batch, seed):
     return out.loss.detach(), grads
 
 
-@pytest.mark.parametrize("padded,recompute", [(True, False), (False, False), (True, True)])
-def test_fused_training_step_matches_hf(tmp_path, padded, recompute, monkeypatch):
+@pytest.mark.parametrize("padded,memory", [(True, "keep"), (False, "keep"), (True, "recompute"),
+                                           (True, "offload")])
+def test_fused_training_step_matches_hf(tmp_path, padded, memory, monkeypatch):
     import solution
-    from solution import decoder
+    from solution import decoder, offload
     from solution.integrate import prepare_model
 
-    monkeypatch.setattr(decoder, "ACTIVATION_BUDGET_MB", 0.0 if recompute else 1e9)
+    monkeypatch.setattr(decoder, "ACTIVATION_BUDGET_MB", 0.0 if memory == "recompute" else 1e9)
+    if memory == "offload":  # every layer's MLP activations through host memory
+        monkeypatch.setattr(offload, "MIN_BYTES", 0)
+        monkeypatch.setattr(decoder.ModelPlan, "memory_plan",
+                            lambda self, tokens: (0, len(self.layers)))
 
     solution.apply()
     model = _tiny_qlora(tmp_path)
