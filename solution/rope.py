@@ -17,12 +17,22 @@ import triton.language as tl
 
 
 @triton.jit
-def qkv_rope_fwd_kernel(qkv_ptr, lq_ptr, lv_ptr, cos_ptr, sin_ptr, q_ptr, k_ptr, v_ptr, T,
-                        cos_sb, q_sb, q_sh, q_st, kv_sb, kv_sh, kv_st,
+def qkv_rope_fwd_kernel(qkv_ptr, lq_ptr, lv_ptr, cos_ptr, sin_ptr, q_ptr, k_ptr, v_ptr, comp_ptr,
+                        T, cos_sb, q_sb, q_sh, q_st, kv_sb, kv_sh, kv_st,
                         NQ: tl.constexpr, NKV: tl.constexpr, REP: tl.constexpr, D: tl.constexpr,
-                        HEADS: tl.constexpr, HAS_LQ: tl.constexpr, HAS_LV: tl.constexpr):
-    n = tl.program_id(0).to(tl.int64)
-    b, t = n // T, n % T
+                        HEADS: tl.constexpr, HAS_LQ: tl.constexpr, HAS_LV: tl.constexpr,
+                        UNPAD: tl.constexpr):
+    """One program per padded position; with UNPAD the inputs are the compact rows of the real
+    tokens (comp maps a padded position to its row, -1 for padding, which gets zeros)."""
+    pos = tl.program_id(0).to(tl.int64)
+    b, t = pos // T, pos % T
+    if UNPAD:
+        n = tl.load(comp_ptr + pos).to(tl.int64)
+        real = n >= 0
+        n = tl.maximum(n, 0)
+    else:
+        n = pos
+        real = pos >= 0
     d = tl.arange(0, D)[None, :]
     swap = (d + D // 2) % D
     sign = tl.where(d < D // 2, -1.0, 1.0)
@@ -31,7 +41,7 @@ def qkv_rope_fwd_kernel(qkv_ptr, lq_ptr, lv_ptr, cos_ptr, sin_ptr, q_ptr, k_ptr,
     h = tl.arange(0, HEADS)[:, None]
     row = qkv_ptr + n * ((NQ + 2 * NKV) * D)
 
-    in_q = h < NQ
+    in_q = (h < NQ) & real
     q = tl.load(row + h * D + d, mask=in_q, other=0.0).to(tl.float32)
     q_sw = tl.load(row + h * D + swap, mask=in_q, other=0.0).to(tl.float32)
     if HAS_LQ:
@@ -39,27 +49,32 @@ def qkv_rope_fwd_kernel(qkv_ptr, lq_ptr, lv_ptr, cos_ptr, sin_ptr, q_ptr, k_ptr,
         q += tl.load(lrow + h * D + d, mask=in_q, other=0.0).to(tl.float32)
         q_sw += tl.load(lrow + h * D + swap, mask=in_q, other=0.0).to(tl.float32)
     q_out = q * cos + (sign * q_sw) * sin
-    tl.store(q_ptr + b * q_sb + h * q_sh + t * q_st + d, q_out.to(tl.float16), mask=in_q)
+    tl.store(q_ptr + b * q_sb + h * q_sh + t * q_st + d, q_out.to(tl.float16), mask=h < NQ)
 
-    in_kv = h < NKV * REP
+    out_kv = h < NKV * REP
+    in_kv = out_kv & real
     src = h // REP
     k = tl.load(row + (NQ + src) * D + d, mask=in_kv, other=0.0).to(tl.float32)
     k_sw = tl.load(row + (NQ + src) * D + swap, mask=in_kv, other=0.0).to(tl.float32)
     k_out = k * cos + (sign * k_sw) * sin
-    tl.store(k_ptr + b * kv_sb + h * kv_sh + t * kv_st + d, k_out.to(tl.float16), mask=in_kv)
+    tl.store(k_ptr + b * kv_sb + h * kv_sh + t * kv_st + d, k_out.to(tl.float16), mask=out_kv)
     v = tl.load(row + (NQ + NKV + src) * D + d, mask=in_kv, other=0.0).to(tl.float32)
     if HAS_LV:
         v += tl.load(lv_ptr + n * (NKV * D) + src * D + d, mask=in_kv, other=0.0).to(tl.float32)
-    tl.store(v_ptr + b * kv_sb + h * kv_sh + t * kv_st + d, v.to(tl.float16), mask=in_kv)
+    tl.store(v_ptr + b * kv_sb + h * kv_sh + t * kv_st + d, v.to(tl.float16), mask=out_kv)
 
 
 @triton.jit
-def qkv_rope_bwd_kernel(dq_ptr, dk_ptr, dv_ptr, cos_ptr, sin_ptr, dqkv_ptr, T, cos_sb,
+def qkv_rope_bwd_kernel(dq_ptr, dk_ptr, dv_ptr, cos_ptr, sin_ptr, dqkv_ptr, pidx_ptr, T, cos_sb,
                         dq_sb, dq_sh, dq_st, dk_sb, dk_sh, dk_st, dv_sb, dv_sh, dv_st,
                         NQ: tl.constexpr, NKV: tl.constexpr, REP: tl.constexpr, D: tl.constexpr,
-                        HEADS: tl.constexpr, KV_HEADS: tl.constexpr):
+                        HEADS: tl.constexpr, KV_HEADS: tl.constexpr, UNPAD: tl.constexpr):
     n = tl.program_id(0).to(tl.int64)
-    b, t = n // T, n % T
+    if UNPAD:
+        pos = tl.load(pidx_ptr + n).to(tl.int64)
+    else:
+        pos = n
+    b, t = pos // T, pos % T
     d = tl.arange(0, D)[None, :]
     swap = (d + D // 2) % D
     sign = tl.where(d < D // 2, -1.0, 1.0)
@@ -93,11 +108,17 @@ def qkv_rope_bwd_kernel(dq_ptr, dk_ptr, dv_ptr, cos_ptr, sin_ptr, dqkv_ptr, T, c
 
 class QKVRope(torch.autograd.Function):
     """qkv [B, T, (NQ + 2 NKV) D] fp16 (+ LoRA outputs for q and v) -> q, k, v for SDPA:
-    q [B, NQ, T, D] in token-major memory, k/v [B, NKV*REP, T, D] contiguous, all fp16."""
+    q [B, NQ, T, D] in token-major memory, k/v [B, NKV*REP, T, D] contiguous, all fp16. With
+    `unpad` the inputs are [n, ...] rows of the real tokens and the outputs are still padded (zeros
+    at the padding positions, which the attention mask hides)."""
 
     @staticmethod
-    def forward(ctx, qkv, lq, lv, cos, sin, nq, nkv, rep, head_dim):
-        batch, seq, _ = qkv.shape
+    def forward(ctx, qkv, lq, lv, cos, sin, nq, nkv, rep, head_dim, unpad):
+        if unpad is not None:  # qkv [n, W] compact rows; unpad = (batch, seq, pidx, comp)
+            batch, seq, pidx, comp = unpad
+        else:
+            batch, seq, _ = qkv.shape
+            pidx = comp = None
         qkv = qkv.contiguous()
         cos, sin = cos.contiguous(), sin.contiguous()
         cos_sb = 0 if cos.shape[0] == 1 else seq * head_dim
@@ -109,30 +130,35 @@ class QKVRope(torch.autograd.Function):
         lv_c = lv.contiguous() if lv is not None else qkv
         heads = triton.next_power_of_2(max(nq, nkv * rep))
         qkv_rope_fwd_kernel[(batch * seq,)](
-            qkv, lq_c, lv_c, cos, sin, q, k, v, seq, cos_sb, q.stride(0), q.stride(1), q.stride(2),
-            k.stride(0), k.stride(1), k.stride(2), NQ=nq, NKV=nkv, REP=rep, D=head_dim,
-            HEADS=heads, HAS_LQ=lq is not None, HAS_LV=lv is not None, num_warps=4)
-        ctx.save_for_backward(cos, sin)
+            qkv, lq_c, lv_c, cos, sin, q, k, v, comp if comp is not None else qkv, seq, cos_sb,
+            q.stride(0), q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2), NQ=nq,
+            NKV=nkv, REP=rep, D=head_dim, HEADS=heads, HAS_LQ=lq is not None,
+            HAS_LV=lv is not None, UNPAD=comp is not None, num_warps=4)
+        ctx.save_for_backward(cos, sin, *(() if pidx is None else (pidx,)))
+        ctx.rows = qkv.shape[:-1]
         ctx.meta = (batch, seq, nq, nkv, rep, head_dim, cos_sb, heads)
         ctx.has_lora = (lq is not None, lv is not None)
         return q, k, v
 
     @staticmethod
     def backward(ctx, dq, dk, dv):
-        cos, sin = ctx.saved_tensors
+        cos, sin, *pidx = ctx.saved_tensors
         batch, seq, nq, nkv, rep, head_dim, cos_sb, heads = ctx.meta
-        dqkv = torch.empty((batch, seq, (nq + 2 * nkv) * head_dim), dtype=torch.float16,
+        dqkv = torch.empty((*ctx.rows, (nq + 2 * nkv) * head_dim), dtype=torch.float16,
                            device=cos.device)
         dq, dk, dv = (g.to(torch.float16) for g in (dq, dk, dv))
-        qkv_rope_bwd_kernel[(batch * seq,)](
-            dq, dk, dv, cos, sin, dqkv, seq, cos_sb, dq.stride(0), dq.stride(1), dq.stride(2),
-            dk.stride(0), dk.stride(1), dk.stride(2), dv.stride(0), dv.stride(1), dv.stride(2),
-            NQ=nq, NKV=nkv, REP=rep, D=head_dim, HEADS=heads,
-            KV_HEADS=triton.next_power_of_2(nkv), num_warps=4)
+        rows = dqkv.numel() // dqkv.shape[-1]
+        qkv_rope_bwd_kernel[(rows,)](
+            dq, dk, dv, cos, sin, dqkv, pidx[0] if pidx else dqkv, seq, cos_sb, dq.stride(0),
+            dq.stride(1), dq.stride(2), dk.stride(0), dk.stride(1), dk.stride(2), dv.stride(0),
+            dv.stride(1), dv.stride(2), NQ=nq, NKV=nkv, REP=rep, D=head_dim, HEADS=heads,
+            KV_HEADS=triton.next_power_of_2(nkv), UNPAD=bool(pidx), num_warps=4)
         dlq = dqkv[..., :nq * head_dim] if ctx.has_lora[0] else None
         dlv = dqkv[..., (nq + nkv) * head_dim:] if ctx.has_lora[1] else None
-        return dqkv, dlq, dlv, None, None, None, None, None, None
+        return dqkv, dlq, dlv, None, None, None, None, None, None, None
 
 
-def qkv_rope(qkv, lq, lv, cos, sin, nq, nkv, rep, head_dim):
-    return QKVRope.apply(qkv, lq, lv, cos, sin, nq, nkv, rep, head_dim)
+def qkv_rope(qkv, lq, lv, cos, sin, nq, nkv, rep, head_dim, unpad=None):
+    """unpad = (batch, seq, pidx, comp) when qkv/lq/lv hold only the real tokens' rows: pidx is
+    each row's padded position, comp the row of each padded position (-1 for padding)."""
+    return QKVRope.apply(qkv, lq, lv, cos, sin, nq, nkv, rep, head_dim, unpad)

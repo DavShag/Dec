@@ -100,27 +100,65 @@ class ModelPlan:
                 and all(LayerPlan.supported(layer) for layer in model.layers))
 
 
-def _lora_out(parts, x32):
+class Unpad:
+    """The real tokens of a right-padded batch: every op but attention runs on these rows only.
+
+    Removing padding inside a batch is allowed by the task; rows of different batches are never
+    mixed. Attention still runs on the padded [B, H, T, D] layout with the base run's mask, so it
+    is the same SDPA call; the q/k/v epilogue writes into that layout and its output is gathered
+    back to the real rows. Varlen packing with cu_seqlens follows FlashAttention-2 (Dao 2023)."""
+
+    def __init__(self, attention_mask):
+        self.batch, self.seq = attention_mask.shape
+        device = attention_mask.device
+        self.pidx = (attention_mask.reshape(-1) != 0).nonzero().squeeze(1)
+        self.comp = torch.full((self.batch * self.seq,), -1, dtype=torch.int32, device=device)
+        self.comp[self.pidx] = torch.arange(self.pidx.numel(), dtype=torch.int32, device=device)
+        self.ones = None
+
+    def rope_args(self):
+        return self.batch, self.seq, self.pidx, self.comp
+
+    def dropout(self, x, p):
+        """F.dropout of the padded [B, T, H] fp32 input, on the real rows: the same RNG draw (same
+        shape, dtype and op as the base run, so the same keep mask), then x * (1/(1-p)) where kept,
+        which is the exact product the dropout kernel forms."""
+        if self.ones is None or self.ones.shape[-1] != x.shape[-1]:
+            self.ones = torch.ones((self.batch, self.seq, x.shape[-1]), dtype=torch.float32,
+                                   device=x.device)
+        keep = torch.native_dropout(self.ones, p, True)[1]
+        keep = keep.view(-1, x.shape[-1]).index_select(0, self.pidx)
+        return torch.where(keep, x * (1.0 / (1.0 - p)), 0.0)
+
+
+def _lora_out(parts, x32, unpad):
     if parts is None:
         return None
     dropout, lora_a, lora_b, scaling = parts
-    return lora_b(lora_a(dropout(x32))) * scaling  # PEFT's own expression, under autocast
+    if unpad is not None and isinstance(dropout, torch.nn.Dropout) and dropout.training \
+            and dropout.p > 0:
+        dropped = unpad.dropout(x32, dropout.p)
+    else:
+        dropped = dropout(x32)
+    return lora_b(lora_a(dropped)) * scaling  # PEFT's own expression, under autocast
 
 
-def _layer(plan, layer, x, pending, mask, cos, sin):
-    batch, seq, _ = x.shape
+def _layer(plan, layer, x, pending, mask, cos, sin, unpad):
+    batch, seq = (unpad.batch, unpad.seq) if unpad is not None else x.shape[:2]
     rep = plan.nq // plan.nkv if mask is not None else 1
     total, h16, h32 = add_rmsnorm(x, pending, layer.norm1.weight, plan.eps,
                                   want32=layer.lora_q is not None or layer.lora_v is not None)
     residual = total if pending is not None else x
     qkv = nf4_linear(h16, layer.qkv, layer.qkv_bias)
-    lq, lv = _lora_out(layer.lora_q, h32), _lora_out(layer.lora_v, h32)
+    lq, lv = _lora_out(layer.lora_q, h32, unpad), _lora_out(layer.lora_v, h32, unpad)
     del h32
-    q, k, v = qkv_rope(qkv, lq, lv, cos, sin, plan.nq, plan.nkv, rep, plan.head_dim)
+    q, k, v = qkv_rope(qkv, lq, lv, cos, sin, plan.nq, plan.nkv, rep, plan.head_dim,
+                       unpad.rope_args() if unpad is not None else None)
     attn = torch.nn.functional.scaled_dot_product_attention(
         q, k, v, attn_mask=mask, dropout_p=0.0, scale=layer.scaling,
         is_causal=mask is None and seq > 1, **({} if rep > 1 else {"enable_gqa": True}))
-    attn = attn.transpose(1, 2).reshape(batch, seq, plan.nq * plan.head_dim)
+    attn = attn.transpose(1, 2).reshape(batch * seq, plan.nq * plan.head_dim)
+    attn = attn.index_select(0, unpad.pidx) if unpad is not None else attn.view(batch, seq, -1)
     residual, m16, _ = add_rmsnorm(residual, nf4_linear(attn, layer.o), layer.norm2.weight,
                                    plan.eps)
     gate, up = nf4_linear(m16, layer.gate_up)
@@ -128,21 +166,35 @@ def _layer(plan, layer, x, pending, mask, cos, sin):
 
 
 def decoder_forward(model, plan, input_ids, attention_mask, position_ids):
-    """last_hidden_state (fp16) of a labelled training forward."""
+    """(last hidden state fp16, unpad) of a labelled training forward: [B, T, H] without padding,
+    else [n, H] for the n real tokens, with `unpad` saying where they sit."""
     from transformers.masking_utils import create_causal_mask
 
-    embeds = model.embed_tokens(input_ids)
+    batch, seq = input_ids.shape
+    unpad = None
+    if attention_mask is not None and not bool(attention_mask.all()):
+        unpad = Unpad(attention_mask)
+    # the mask and RoPE helpers read only the shape, dtype and device of the embeddings
+    probe = torch.empty((batch, seq, 1), dtype=torch.float32, device=input_ids.device)
     if position_ids is None:
-        position_ids = torch.arange(embeds.shape[1], device=embeds.device).unsqueeze(0)
-    mask = create_causal_mask(config=model.config, inputs_embeds=embeds,
+        position_ids = torch.arange(seq, device=input_ids.device).unsqueeze(0)
+    mask = create_causal_mask(config=model.config, inputs_embeds=probe,
                               attention_mask=attention_mask, past_key_values=None,
                               position_ids=position_ids)
-    cos, sin = model.rotary_emb(embeds, position_ids)
-    x, pending = embeds, None
+    cos, sin = model.rotary_emb(probe, position_ids)
+    ids = input_ids.reshape(-1).index_select(0, unpad.pidx) if unpad is not None else input_ids
+    x, pending = model.embed_tokens(ids), None
     for layer in plan.layers:
-        x, pending = _layer(plan, layer, x, pending, mask, cos, sin)
+        x, pending = _layer(plan, layer, x, pending, mask, cos, sin, unpad)
     _, hidden, _ = add_rmsnorm(x, pending, plan.final_norm.weight, plan.eps)
-    return hidden
+    return hidden, unpad
+
+
+def plain_training_call(input_ids, inputs_embeds, past_key_values, use_cache, kwargs):
+    """A call the fused decoder handles: token ids on CUDA, no cache, no extra outputs."""
+    return (input_ids is not None and inputs_embeds is None and past_key_values is None
+            and not use_cache and input_ids.is_cuda and torch.is_grad_enabled()
+            and not kwargs.get("output_hidden_states") and not kwargs.get("output_attentions"))
 
 
 def prepare_decoder(model):
@@ -151,28 +203,3 @@ def prepare_decoder(model):
         return False
     setattr(model, PLAN_ATTR, ModelPlan(model))
     return True
-
-
-def patch_qwen2_model():
-    from transformers.modeling_outputs import BaseModelOutputWithPast
-    from transformers.models.qwen2 import modeling_qwen2
-
-    original = modeling_qwen2.Qwen2Model.forward
-    if getattr(original, "_soupk", False):
-        return
-
-    def forward(self, input_ids=None, attention_mask=None, position_ids=None,
-                past_key_values=None, inputs_embeds=None, use_cache=None, **kwargs):
-        plan = getattr(self, PLAN_ATTR, None)
-        if (plan is None or not self.training or not torch.is_grad_enabled() or use_cache
-                or past_key_values is not None or input_ids is None or inputs_embeds is not None
-                or kwargs.get("output_hidden_states") or kwargs.get("output_attentions")
-                or not input_ids.is_cuda):
-            return original(self, input_ids=input_ids, attention_mask=attention_mask,
-                            position_ids=position_ids, past_key_values=past_key_values,
-                            inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
-        hidden = decoder_forward(self, plan, input_ids, attention_mask, position_ids)
-        return BaseModelOutputWithPast(last_hidden_state=hidden, past_key_values=None)
-
-    forward._soupk = True
-    modeling_qwen2.Qwen2Model.forward = forward

@@ -297,3 +297,45 @@ def test_fused_training_step_matches_hf(tmp_path, padded):
     for name, ref in ref_grads.items():
         rel = (grads[name] - ref).norm() / ref.norm().clamp(min=1e-12)
         assert rel < 2e-2, f"{name}: relative gradient error {rel:.3e}"
+
+
+def test_qkv_rope_unpadded_matches_padded():
+    from solution.decoder import Unpad
+    from solution.rope import qkv_rope
+
+    torch.manual_seed(0)
+    batch, seq, nq, nkv, d = 3, 50, 12, 2, 128
+    mask = torch.ones(batch, seq, dtype=torch.long, device="cuda")
+    mask[1, 37:] = 0
+    mask[2, 9:] = 0
+    unpad = Unpad(mask)
+    qkv = (torch.randn(batch, seq, (nq + 2 * nkv) * d, device="cuda") * 2).half()
+    lq = (torch.randn(batch, seq, nq * d, device="cuda") * 0.1).half()
+    lv = (torch.randn(batch, seq, nkv * d, device="cuda") * 0.1).half()
+    pos = torch.arange(seq, device="cuda").float()
+    inv = 1.0 / (1e6 ** (torch.arange(0, d, 2, device="cuda").float() / d))
+    emb = torch.cat([pos[:, None] * inv[None], pos[:, None] * inv[None]], -1)[None]
+    cos, sin = emb.cos(), emb.sin()
+    grads = [torch.randn(batch, h, seq, d, device="cuda").half() for h in (nq, 12, 12)]
+    real = mask.bool()
+    for g in grads:  # the padded positions' gradients are zero in training (outputs discarded)
+        g.transpose(1, 2)[~real] = 0
+
+    def run(compact):
+        tensors = [t.clone().requires_grad_() for t in (qkv, lq, lv)]
+        if compact:
+            inputs = [t.reshape(batch * seq, -1).index_select(0, unpad.pidx) for t in tensors]
+            outs = qkv_rope(*inputs, cos, sin, nq, nkv, 6, d, unpad.rope_args())
+        else:
+            outs = qkv_rope(*tensors, cos, sin, nq, nkv, 6, d)
+        sum(((o.float() * g.float()).sum() for o, g in zip(outs, grads))).backward()
+        return outs, [t.grad for t in tensors]
+
+    padded, padded_grads = run(False)
+    compact, compact_grads = run(True)
+    for p_out, c_out in zip(padded, compact):
+        torch.testing.assert_close(c_out.transpose(1, 2)[real], p_out.transpose(1, 2)[real],
+                                   rtol=0, atol=0)
+        assert torch.all(c_out.transpose(1, 2)[~real] == 0)
+    for p_grad, c_grad in zip(padded_grads, compact_grads):
+        torch.testing.assert_close(c_grad[real], p_grad[real], rtol=0, atol=0)

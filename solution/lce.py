@@ -141,18 +141,31 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
         return grad, None, None, None, None
 
 
-def fused_linear_cross_entropy(hidden, weight, labels, attention_mask=None, num_items_in_batch=None):
+def fused_linear_cross_entropy(hidden, weight, labels, attention_mask=None, num_items_in_batch=None,
+                               rows=None):
     """ForCausalLMLoss(hidden @ weight.T, labels) without the logits.
 
     Returns (loss, entropy [B, T], token_loss [B, T], correct, labelled): entropy of every position,
     the cross-entropy of position t against labels[t + 1] (0 where there is none), and the argmax
     hits and count of the labelled positions, which is what TRL and Soup's rewind log read.
+    With `rows`, hidden holds only those flattened positions ([n, H], the real tokens); the
+    per-position outputs are still [B, T], zero elsewhere.
     """
     if weight.dtype != torch.float16:
         weight = weight.to(torch.float16)
     targets = torch.nn.functional.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:]
-    real = attention_mask if attention_mask is not None else torch.ones_like(labels)
     denominator = num_items_in_batch
     if torch.is_tensor(denominator):
         denominator = denominator.to(hidden.device)
-    return FusedLinearCrossEntropy.apply(hidden, weight, targets.contiguous(), real, denominator)
+    if rows is None:
+        real = attention_mask if attention_mask is not None else torch.ones_like(labels)
+        return FusedLinearCrossEntropy.apply(hidden, weight, targets.contiguous(), real,
+                                             denominator)
+    targets = targets.reshape(-1).index_select(0, rows)
+    loss, entropy, token_loss, correct, total = FusedLinearCrossEntropy.apply(
+        hidden, weight, targets, torch.ones_like(targets), denominator)
+    full = []
+    for values in (entropy, token_loss):
+        out = torch.zeros(labels.numel(), dtype=values.dtype, device=values.device)
+        full.append(out.index_copy_(0, rows, values.reshape(-1)).view(labels.shape))
+    return loss, full[0], full[1], correct, total

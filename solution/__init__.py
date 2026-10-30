@@ -4,7 +4,6 @@ The harness calls `apply()` once, before Soup builds the model and the trainer. 
 what each kernel does and where the ideas come from.
 """
 
-from .decoder import patch_qwen2_model
 from .integrate import patch_causal_lm, patch_setup, patch_sft_trainer
 from .swiglu import patch_qwen2_mlp
 
@@ -12,6 +11,5 @@ from .swiglu import patch_qwen2_mlp
 def apply():
     patch_qwen2_mlp()     # the starter kit's example; kept, it does not count as ours
     patch_setup()         # fp16 tied embedding / head, fp32 embedding rows (our gather kernel)
-    patch_qwen2_model()   # fused decoder stack (decoder.py: nf4.py, norm.py, rope.py)
-    patch_causal_lm()     # fused head + loss + metrics (lce.py)
+    patch_causal_lm()     # fused decoder stack (decoder.py) + fused head and loss (lce.py)
     patch_sft_trainer()   # TRL metrics and Soup's rewind log from the fused head

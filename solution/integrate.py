@@ -23,7 +23,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .decoder import prepare_decoder
+from .decoder import PLAN_ATTR, decoder_forward, plain_training_call, prepare_decoder
 from .lce import fused_linear_cross_entropy
 
 FUSED_ATTR = "_soupk_fused_head"
@@ -124,17 +124,24 @@ def patch_causal_lm():
                             position_ids=position_ids, past_key_values=past_key_values,
                             inputs_embeds=inputs_embeds, labels=labels, use_cache=use_cache,
                             logits_to_keep=logits_to_keep, **kwargs)
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask,
-                             position_ids=position_ids, past_key_values=past_key_values,
-                             inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
+        plan = getattr(self.model, PLAN_ATTR, None)
+        if plan is not None and plain_training_call(input_ids, inputs_embeds, past_key_values,
+                                                    use_cache, kwargs):
+            hidden, unpad = decoder_forward(self.model, plan, input_ids, attention_mask,
+                                            position_ids)
+            rows, extra = (unpad.pidx if unpad is not None else None), {}
+        else:
+            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask,
+                                 position_ids=position_ids, past_key_values=past_key_values,
+                                 inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
+            hidden, rows = outputs.last_hidden_state, None
+            extra = {"past_key_values": outputs.past_key_values,
+                     "hidden_states": outputs.hidden_states, "attentions": outputs.attentions}
         loss, entropy, token_loss, correct, total = fused_linear_cross_entropy(
-            outputs.last_hidden_state, self.lm_head.weight, labels, attention_mask,
-            kwargs.get("num_items_in_batch"))
+            hidden, self.lm_head.weight, labels, attention_mask,
+            kwargs.get("num_items_in_batch"), rows=rows)
         _LAST["step"] = _Step(entropy, token_loss, correct, total)
-        return CausalLMOutputWithPast(loss=loss, logits=None,
-                                      past_key_values=outputs.past_key_values,
-                                      hidden_states=outputs.hidden_states,
-                                      attentions=outputs.attentions)
+        return CausalLMOutputWithPast(loss=loss, logits=None, **extra)
 
     forward._soupk = True
     modeling_qwen2.Qwen2ForCausalLM.forward = forward
