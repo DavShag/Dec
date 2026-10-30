@@ -10,13 +10,20 @@ The arguments mirror the real launches (same dtypes, same integer divisibility, 
 launch options), or the compiled variant would not be the one training asks for.
 """
 
+import os
 import sys
 import threading
+import time
 
 import torch
 import triton
 
 GRID = (1,)
+# When to start: "apply" (as soon as apply() runs, overlapping Soup's imports) or "setup" (when Soup
+# starts loading the model). SOUPK_WARMUP is a development switch for measuring the two.
+WHEN = os.environ.get("SOUPK_WARMUP", "apply")
+TIMES = []  # (perf_counter, event): when the thread started and finished, for the timeline tool
+_started = False
 
 
 def _model_dims():
@@ -47,12 +54,9 @@ def _compile_all(dims):
     # forward, in the order a step first needs them
     integrate.embed_fp32_kernel.warmup(i64, f16, f32, hidden, BLOCK_H=block_h, num_warps=4,
                                        grid=GRID)
-    for has_delta, lora in ((False, True), (True, True), (True, False)):
-        norm.add_rmsnorm_fwd_kernel.warmup(
-            f32, f16 if has_delta else f32, f32, f32, f16, f16, f32, torch.bool if lora else f32,
-            torch.bool if lora else f32, i64 if lora else f32, f16, f16, hidden, 1e-6, 1.05, 1.05,
-            HAS_DELTA=has_delta, WRITE32=False, LORA=lora, BLOCK_H=block_h, num_warps=8,
-            grid=GRID)
+    norm.add_rmsnorm_fwd_kernel.warmup(
+        f32, f16, f32, f32, f16, f32, f32, torch.bool, torch.bool, i64, f16, f16, hidden, 1e-6,
+        1.05, 1.05, 1, 0, 1, BLOCK_H=block_h, num_warps=8, grid=GRID)
     nf4.nf4_dequant_kernel.warmup(u8, u8, f32, f32, f32, f16, 0.5, 1024, BLOCK=nf4.BLOCK_BYTES,
                                   num_warps=4, enable_fp_fusion=False, grid=GRID)
     rope.qkv_rope_fwd_kernel.warmup(f16, f16, f16, f32, f32, i64, f16, f16, f16, 64, 0, NQ=nq,
@@ -60,9 +64,8 @@ def _compile_all(dims):
                                     num_warps=4, grid=GRID)
     swiglu.example_swiglu_fwd_kernel.warmup(f16, f16, f16, 8960 * 16, BLOCK=swiglu.BLOCK,
                                             grid=GRID)
-    for with_grad in (True, False):
-        lce.lce_row_kernel.warmup(f16, vocab, i64, f32, f32, i32, vocab, lce.GRAD_SCALE,
-                                  WITH_GRAD=with_grad, BLOCK_V=lce.BLOCK_V, num_warps=8, grid=GRID)
+    lce.lce_row_kernel.warmup(f16, vocab, i64, f32, f32, i32, vocab, lce.GRAD_SCALE, 1,
+                              BLOCK_V=lce.BLOCK_V, num_warps=8, grid=GRID)
     # backward
     rope.qkv_rope_bwd_kernel.warmup(f16, f16, f16, f32, f32, i64, f16, 64, 0, nq * head_dim,
                                     head_dim, nq * head_dim, head_dim, nq * head_dim, head_dim,
@@ -70,27 +73,28 @@ def _compile_all(dims):
                                     KV_HEADS=triton.next_power_of_2(nkv), num_warps=4, grid=GRID)
     swiglu.example_swiglu_bwd_kernel.warmup(f16, f16, f16, f16, f16, 8960 * 16,
                                             BLOCK=swiglu.BLOCK, grid=GRID)
-    for lora, gsum in ((True, True), (False, True), (False, False)):
-        norm.add_rmsnorm_bwd_kernel.warmup(
-            f32, f32, f32, f16, f32, f32, f16 if lora else f32, f16 if lora else f32,
-            torch.bool if lora else f32, torch.bool if lora else f32, i64 if lora else f32, f32,
-            f16, hidden, 1.05, 1.05, HAS_GY16=True, HAS_GY32=False, HAS_GSUM=gsum, LORA=lora,
-            WRITE_DDELTA=True, BLOCK_H=block_h, num_warps=8, grid=GRID)
-
+    norm.add_rmsnorm_bwd_kernel.warmup(
+        f32, f32, f32, f16, f32, f32, f16, f16, torch.bool, torch.bool, i64, f32, f16, hidden,
+        1.05, 1.05, 1, 0, 1, 1, 1, BLOCK_H=block_h, num_warps=8, grid=GRID)
 
 def _run():
+    TIMES.append((time.perf_counter(), "warmup start"))
     try:
         dims = _model_dims()
         if dims is not None:
             _compile_all(dims)
     except Exception:  # noqa: BLE001 - a warm-up failure only means compiling on first launch
         pass
+    TIMES.append((time.perf_counter(), "warmup end"))
 
 
-def start():
-    """Start compiling in the background (no-op outside `soup train` or without CUDA)."""
-    if not torch.cuda.is_available() or "--config" not in sys.argv:
+def start(when="apply"):
+    """Start compiling in the background, once, at the configured point (no-op outside
+    `soup train` or without CUDA)."""
+    global _started
+    if _started or when != WHEN or not torch.cuda.is_available() or "--config" not in sys.argv:
         return None
+    _started = True
     thread = threading.Thread(target=_run, name="soupk-triton-warmup", daemon=True)
     thread.start()
     return thread

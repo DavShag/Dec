@@ -31,10 +31,10 @@ BLOCK_V = 2048
 GRAD_SCALE = 1024.0
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["with_grad"])  # one compiled variant for both uses
 def lce_row_kernel(logits_ptr, stride, target_ptr, ent_ptr, loss_ptr, hit_ptr, V, grad_scale,
-                   WITH_GRAD: tl.constexpr, BLOCK_V: tl.constexpr):
-    """One row of logits: entropy, cross-entropy, argmax hit; with WITH_GRAD also overwrite the
+                   with_grad, BLOCK_V: tl.constexpr):
+    """One row of logits: entropy, cross-entropy, argmax hit; with with_grad also overwrite the
     row with (softmax - onehot) * grad_scale in fp16."""
     row = tl.program_id(0)
     ptr = logits_ptr + row.to(tl.int64) * stride
@@ -68,7 +68,7 @@ def lce_row_kernel(logits_ptr, stride, target_ptr, ent_ptr, loss_ptr, hit_ptr, V
     tl.store(loss_ptr + row, tl.where(labelled, lse - z_target, 0.0))
     tl.store(hit_ptr + row, (labelled & (best_idx == target)).to(tl.int32))
 
-    if WITH_GRAD:
+    if with_grad:
         for start in range(0, V, BLOCK_V):
             cols = start + offs
             inside = cols < V
@@ -112,7 +112,7 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
                 part_hit = torch.empty(count, dtype=torch.int32, device=flat.device)
                 lce_row_kernel[(count,)](logits, logits.stride(0), targets.index_select(0, index),
                                          part_ent, part_loss, part_hit, vocab, GRAD_SCALE,
-                                         WITH_GRAD=grad, BLOCK_V=BLOCK_V, num_warps=8)
+                                         int(grad), BLOCK_V=BLOCK_V, num_warps=8)
                 entropy.index_copy_(0, index, part_ent)
                 token_loss.index_copy_(0, index, part_loss)
                 hits.index_copy_(0, index, part_hit)

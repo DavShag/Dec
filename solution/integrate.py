@@ -24,6 +24,7 @@ import triton
 import triton.language as tl
 
 from .decoder import PLAN_ATTR, decoder_forward, plain_training_call, prepare_decoder
+from . import warmup
 from .lce import fused_linear_cross_entropy
 
 FUSED_ATTR = "_soupk_fused_head"
@@ -100,6 +101,7 @@ def patch_setup():
         return
 
     def _setup_transformers(self, *args, **kwargs):
+        warmup.start("setup")
         result = original(self, *args, **kwargs)
         prepare_model(getattr(self, "model", None))
         return result
