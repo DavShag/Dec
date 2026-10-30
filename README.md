@@ -123,19 +123,21 @@ exceed a budget, gives up just enough of them, cheapest bytes first (our own cod
 2. only if every layer has done so, leading layers are recomputed whole (`torch.utils.checkpoint`,
    with the RNG state restored, so they draw the same dropout masks).
 
-Short batches pay nothing. The two budgets we weighed, one Kaggle session (base 86.6 s /
+Short batches pay nothing. The budgets we weighed, one Kaggle session (base 86.6 s /
 14,345 MiB), two solution runs each:
 
 | Activation budget | `soup train` | Training loop | Peak GPU memory | Speed / memory vs base |
 |---|---|---|---|---|
 | 1300 MiB | 47.8 / 51.0 s | 28.5 / 31.6 s | 2,831 MiB | 1.75x / 5.07x |
 | 1000 MiB | 50.8 / 51.2 s | 31.6 / 31.6 s | 2,551 MiB | 1.70x / 5.62x |
+| 800 MiB | 52.9 / 51.0 s | 33.3 / 31.7 s | 2,331 MiB | 1.67x / 6.15x |
 
 The peak is exact (it follows the budget); the time is not: the two runs at 1300 differ by 3 s,
-about what 1000 costs over 1300 (~1.5 s of the training loop by the averages). The score is
-logarithmic in both ratios and relative to the best team, so the choice depends on the others: if
-another team's memory is better than ours, 1000 gains more on memory than it loses on speed; if
-ours is the best, memory points are full either way and 1300 is the faster run. We use 1300.
+about what 1000 costs over 1300 (~1.5 s of the training loop by the averages; 800: ~2.4 s). The
+score is logarithmic in both ratios and relative to the best team, so the choice depends on the
+others: if another team's memory is better than ours, 1000 or 800 gain more on memory than they
+lose on speed; if ours is the best, memory points are full either way and 1300 is the faster run.
+We use 1300.
 
 ### 8. Compile warm-up (`warmup.py`)
 Every measured run starts with an empty Triton cache, and compilation counts. A background thread

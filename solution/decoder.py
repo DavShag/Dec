@@ -39,8 +39,8 @@ PLAN_ATTR = "_soupk_plan"
 # Saved activations allowed per step; a step that would keep more first drops gate/up of some
 # layers (they repeat the gate|up GEMMs in backward), then recomputes whole leading layers.
 # Kaggle T4, one session: 1300 MiB -> peak 2,831 MiB; 1000 MiB -> 2,551 MiB for ~1.5 s more of the
-# training loop. We keep the speed: 1000 is the choice that leans on memory (README, "Adaptive
-# recomputation").
+# training loop; 800 MiB -> 2,331 MiB for ~2.4 s more. We keep the speed: 1000 and 800 are the
+# choices that lean on memory (README, "Adaptive recomputation").
 ACTIVATION_BUDGET_MB = 1300
 _ATEN = torch.ops.aten
 _EFFICIENT_ATTENTION = all(hasattr(_ATEN, name) for name in (
