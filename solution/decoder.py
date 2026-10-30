@@ -19,7 +19,11 @@ it sees. What goes away: fp32 copies of fp16 GEMM outputs, fp32 MLP intermediate
 each norm output, the separate elementwise kernels, and the saved tensors that came with them.
 """
 
+import math
+import os
+
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from .nf4 import NF4Weight, nf4_linear, nf4_supported
 from .norm import add_rmsnorm
@@ -27,6 +31,8 @@ from .rope import qkv_rope
 from .swiglu import swiglu
 
 PLAN_ATTR = "_soupk_plan"
+# Saved activations allowed per step; a step that would keep more recomputes its first layers.
+ACTIVATION_BUDGET_MB = float(os.environ.get("SOUPK_ACTIVATION_BUDGET_MB", "1000"))
 
 
 def _base(module):
@@ -87,6 +93,23 @@ class ModelPlan:
         self.nq, self.nkv = config.num_attention_heads, config.num_key_value_heads
         self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // self.nq
         self.final_norm = model.norm
+        hidden, inter = config.hidden_size, config.intermediate_size
+        # bytes a layer keeps for backward per token: two fp32 norm inputs, two fp16 adapter
+        # inputs, two keep masks, q/k/v and the attention output in fp16, gate and up in fp16
+        self.kept_per_token = 22 * hidden + 4 * inter
+        self.recomputed_per_token = 6 * hidden  # a recomputed layer keeps only its inputs
+
+    def recompute_count(self, tokens):
+        """How many leading layers this step recomputes in backward to stay within the budget.
+
+        The peak memory of the run is set by its largest batches, so only those pay for
+        recomputation; shorter batches run without it."""
+        layers = len(self.layers)
+        excess = tokens * self.kept_per_token * layers - ACTIVATION_BUDGET_MB * 2**20
+        if excess <= 0:
+            return 0
+        saved_per_layer = tokens * (self.kept_per_token - self.recomputed_per_token)
+        return min(layers, math.ceil(excess / saved_per_layer))
 
     @staticmethod
     def supported(model):
@@ -208,8 +231,16 @@ def decoder_forward(model, plan, input_ids, attention_mask, position_ids):
     probe = torch.empty((batch, seq, 1), dtype=torch.float32, device=input_ids.device)
     cos, sin = model.rotary_emb(probe, position_ids)
     x, pending = model.embed_tokens(input_ids.reshape(-1).index_select(0, unpad.pidx)), None
-    for layer in plan.layers:
-        x, pending = _layer(plan, layer, x, pending, cos, sin, unpad)
+    recompute = plan.recompute_count(unpad.pidx.numel())
+    for index, layer in enumerate(plan.layers):
+        if index < recompute:
+            # our own recomputation (allowed by the task; Soup's gradient_checkpointing stays off):
+            # backward reruns this layer from its inputs; the RNG state is restored for the
+            # rerun, so its dropout masks are the ones drawn now
+            x, pending = checkpoint(_layer, plan, layer, x, pending, cos, sin, unpad,
+                                    use_reentrant=False, preserve_rng_state=True)
+        else:
+            x, pending = _layer(plan, layer, x, pending, cos, sin, unpad)
     _, hidden, _, _, _ = add_rmsnorm(x, pending, plan.final_norm.weight, plan.eps)
     return hidden, unpad
 

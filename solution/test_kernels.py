@@ -279,10 +279,13 @@ def _train_step(model, batch, seed):
     return out.loss.detach(), grads
 
 
-@pytest.mark.parametrize("padded", [True, False])
-def test_fused_training_step_matches_hf(tmp_path, padded):
+@pytest.mark.parametrize("padded,recompute", [(True, False), (False, False), (True, True)])
+def test_fused_training_step_matches_hf(tmp_path, padded, recompute, monkeypatch):
     import solution
+    from solution import decoder
     from solution.integrate import prepare_model
+
+    monkeypatch.setattr(decoder, "ACTIVATION_BUDGET_MB", 0.0 if recompute else 1e9)
 
     solution.apply()
     model = _tiny_qlora(tmp_path)
