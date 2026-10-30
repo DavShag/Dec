@@ -275,7 +275,7 @@ def test_causal_attention_matches_sdpa():
         torch.testing.assert_close(ours_grad, t.grad, rtol=1e-3, atol=1e-3)  # deterministic
 
 
-def _tiny_qlora(tmp_path):
+def _tiny_qlora(tmp_path, lora_dropout=0.05):
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
     from transformers import (AutoModelForCausalLM, BitsAndBytesConfig, Qwen2Config,
                               Qwen2ForCausalLM)
@@ -293,7 +293,7 @@ def _tiny_qlora(tmp_path):
                                                  dtype=torch.float16, device_map={"": 0},
                                                  attn_implementation="sdpa")
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
-    model = get_peft_model(model, LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05,
+    model = get_peft_model(model, LoraConfig(r=16, lora_alpha=32, lora_dropout=lora_dropout,
                                              target_modules=["q_proj", "v_proj"],
                                              task_type="CAUSAL_LM"))
     for name, param in model.named_parameters():
@@ -320,9 +320,11 @@ _PLANS = {"keep": None, "full": None, "mlp": lambda layers: (0, layers),
           "mixed": lambda layers: (1, layers - 1)}
 
 
-@pytest.mark.parametrize("padded,plan", [(True, "keep"), (False, "keep"), (True, "full"),
-                                         (True, "mlp"), (True, "mixed")])
-def test_fused_training_step_matches_hf(tmp_path, padded, plan, monkeypatch):
+@pytest.mark.parametrize("padded,plan,dropout", [(True, "keep", 0.05), (False, "keep", 0.05),
+                                                 (True, "full", 0.05), (True, "mlp", 0.05),
+                                                 (True, "mixed", 0.05), (True, "keep", 0.0),
+                                                 (True, "mixed", 0.0)])
+def test_fused_training_step_matches_hf(tmp_path, padded, plan, dropout, monkeypatch):
     import solution
     from solution import decoder
     from solution.integrate import prepare_model
@@ -333,7 +335,7 @@ def test_fused_training_step_matches_hf(tmp_path, padded, plan, monkeypatch):
                             lambda self, tokens: _PLANS[plan](len(self.layers)))
 
     solution.apply()
-    model = _tiny_qlora(tmp_path)
+    model = _tiny_qlora(tmp_path, dropout)  # without dropout: the norm's y32 + PEFT's modules path
     gen = torch.Generator().manual_seed(1)
     ids = torch.randint(0, 1024, (3, 40), generator=gen).cuda()
     mask = torch.ones_like(ids)

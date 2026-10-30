@@ -163,11 +163,12 @@ it does not count toward our share.
 
 ## How we checked it
 
-- `python -m pytest solution -q` (25 tests, on a GPU): each kernel against plain PyTorch, forward
+- `python -m pytest solution -q` (27 tests, on a GPU): each kernel against plain PyTorch, forward
   and backward (NF4 bit-exact vs bitsandbytes; norm, RoPE epilogue, fused head with padding, real
   vocabulary and the fp16 loss scale; attention against the SDPA call it replaces), plus whole
   training steps of a small 4-bit Qwen2 with PEFT LoRA against transformers + peft + bitsandbytes
-  (padded / unpadded / gate|up repeated / whole layers recomputed / both): loss within 2e-6
+  (padded / unpadded / gate|up repeated / whole layers recomputed / both; with and without LoRA
+  dropout): loss within 2e-6
   relative, LoRA gradients within 5e-3; bitwise: the repeated gate|up against the kept one, the
   adapters' A inside the norm against PEFT's `lora_A`; and a
   check that the warm-up compiles exactly the kernel variants a training step launches; the
