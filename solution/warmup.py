@@ -53,22 +53,19 @@ def _compile_all(dims):
             1e-6, HAS_DELTA=has_delta, WRITE32=write32, BLOCK_H=block_h, num_warps=8, grid=GRID)
     nf4.nf4_dequant_kernel.warmup(u8, u8, f32, f32, f32, f16, 0.5, 1024, BLOCK=nf4.BLOCK_BYTES,
                                   num_warps=4, enable_fp_fusion=False, grid=GRID)
-    for unpad, rep in ((True, nq // nkv), (False, 1)):
-        rope.qkv_rope_fwd_kernel.warmup(
-            f16, f16, f16, f32, f32, f16, f16, f16, i32 if unpad else f16, 64, 0, 128, 128, 128,
-            128, 128, 128, NQ=nq, NKV=nkv, REP=rep, D=head_dim, HEADS=heads, HAS_LQ=True,
-            HAS_LV=True, UNPAD=unpad, num_warps=4, grid=GRID)
+    rope.qkv_rope_fwd_kernel.warmup(f16, f16, f16, f32, f32, i64, f16, f16, f16, 64, 0, NQ=nq,
+                                    NKV=nkv, D=head_dim, HEADS=heads, HAS_LQ=True, HAS_LV=True,
+                                    num_warps=4, grid=GRID)
     swiglu.example_swiglu_fwd_kernel.warmup(f16, f16, f16, 8960 * 16, BLOCK=swiglu.BLOCK,
                                             grid=GRID)
     for with_grad in (True, False):
         lce.lce_row_kernel.warmup(f16, vocab, i64, f32, f32, i32, vocab, lce.GRAD_SCALE,
                                   WITH_GRAD=with_grad, BLOCK_V=lce.BLOCK_V, num_warps=8, grid=GRID)
     # backward
-    for unpad, rep in ((True, nq // nkv), (False, 1)):
-        rope.qkv_rope_bwd_kernel.warmup(
-            f16, f16, f16, f32, f32, f16, i64 if unpad else f16, 64, 0, 128, 128, 128, 128, 128,
-            128, 128, 128, 128, NQ=nq, NKV=nkv, REP=rep, D=head_dim, HEADS=heads,
-            KV_HEADS=triton.next_power_of_2(nkv), UNPAD=unpad, num_warps=4, grid=GRID)
+    rope.qkv_rope_bwd_kernel.warmup(f16, f16, f16, f32, f32, i64, f16, 64, 0, nq * head_dim,
+                                    head_dim, nq * head_dim, head_dim, nq * head_dim, head_dim,
+                                    NQ=nq, NKV=nkv, D=head_dim, HEADS=heads,
+                                    KV_HEADS=triton.next_power_of_2(nkv), num_warps=4, grid=GRID)
     swiglu.example_swiglu_bwd_kernel.warmup(f16, f16, f16, f16, f16, 8960 * 16,
                                             BLOCK=swiglu.BLOCK, grid=GRID)
     for gy32, gsum in ((True, True), (False, True), (False, False)):

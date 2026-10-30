@@ -125,11 +125,13 @@ def patch_causal_lm():
                             inputs_embeds=inputs_embeds, labels=labels, use_cache=use_cache,
                             logits_to_keep=logits_to_keep, **kwargs)
         plan = getattr(self.model, PLAN_ATTR, None)
+        fused = None
         if plan is not None and plain_training_call(input_ids, inputs_embeds, past_key_values,
                                                     use_cache, kwargs):
-            hidden, unpad = decoder_forward(self.model, plan, input_ids, attention_mask,
-                                            position_ids)
-            rows, extra = (unpad.pidx if unpad is not None else None), {}
+            fused = decoder_forward(self.model, plan, input_ids, attention_mask, position_ids)
+        if fused is not None:
+            hidden, unpad = fused
+            rows, extra = unpad.pidx, {}
         else:
             outputs = self.model(input_ids=input_ids, attention_mask=attention_mask,
                                  position_ids=position_ids, past_key_values=past_key_values,

@@ -101,23 +101,26 @@ class ModelPlan:
 
 
 class Unpad:
-    """The real tokens of a right-padded batch: every op but attention runs on these rows only.
+    """The real tokens of a right-padded batch: every op runs on these rows only.
 
     Removing padding inside a batch is allowed by the task; rows of different batches are never
-    mixed. Attention still runs on the padded [B, H, T, D] layout with the base run's mask, so it
-    is the same SDPA call; the q/k/v epilogue writes into that layout and its output is gathered
-    back to the real rows. Varlen packing with cu_seqlens follows FlashAttention-2 (Dao 2023)."""
+    mixed. Attention runs per row with is_causal (the memory-efficient SDPA kernel then skips the
+    blocks above the diagonal), which for right padding is exactly what the base run's padded,
+    masked SDPA computes for the real tokens, at a fraction of the work. Packing variable-length
+    rows this way follows FlashAttention-2's varlen interface (Dao 2023)."""
 
-    def __init__(self, attention_mask):
-        self.batch, self.seq = attention_mask.shape
-        device = attention_mask.device
-        self.pidx = (attention_mask.reshape(-1) != 0).nonzero().squeeze(1)
-        self.comp = torch.full((self.batch * self.seq,), -1, dtype=torch.int32, device=device)
-        self.comp[self.pidx] = torch.arange(self.pidx.numel(), dtype=torch.int32, device=device)
+    def __init__(self, attention_mask, batch, seq, device):
+        steps = torch.arange(seq, device=device)
+        if attention_mask is None:
+            lengths = torch.full((batch,), seq, device=device)
+            self.right_padded = True
+        else:
+            lengths = attention_mask.sum(1)
+            self.right_padded = bool(((attention_mask != 0) == (steps < lengths[:, None])).all())
+        self.batch, self.seq = batch, seq
+        self.pidx = (steps < lengths[:, None]).reshape(-1).nonzero().squeeze(1)
+        self.lengths = lengths.tolist()
         self.ones = None
-
-    def rope_args(self):
-        return self.batch, self.seq, self.pidx, self.comp
 
     def dropout(self, x, p):
         """F.dropout of the padded [B, T, H] fp32 input, on the real rows: the same RNG draw (same
@@ -135,30 +138,34 @@ def _lora_out(parts, x32, unpad):
     if parts is None:
         return None
     dropout, lora_a, lora_b, scaling = parts
-    if unpad is not None and isinstance(dropout, torch.nn.Dropout) and dropout.training \
-            and dropout.p > 0:
+    if isinstance(dropout, torch.nn.Dropout) and dropout.training and dropout.p > 0:
         dropped = unpad.dropout(x32, dropout.p)
     else:
         dropped = dropout(x32)
     return lora_b(lora_a(dropped)) * scaling  # PEFT's own expression, under autocast
 
 
-def _layer(plan, layer, x, pending, mask, cos, sin, unpad):
-    batch, seq = (unpad.batch, unpad.seq) if unpad is not None else x.shape[:2]
-    rep = plan.nq // plan.nkv if mask is not None else 1
+def _attention(q, k, v, lengths, scaling):
+    """Causal SDPA per row on [n, heads, head_dim] rows; [n, heads * head_dim] out."""
+    rows = []
+    for qr, kr, vr in zip(q.split(lengths), k.split(lengths), v.split(lengths)):
+        out = torch.nn.functional.scaled_dot_product_attention(
+            qr.transpose(0, 1)[None], kr.transpose(0, 1)[None], vr.transpose(0, 1)[None],
+            dropout_p=0.0, scale=scaling, is_causal=qr.shape[0] > 1)
+        rows.append(out[0].transpose(0, 1).reshape(qr.shape[0], -1))
+    return torch.cat(rows) if len(rows) > 1 else rows[0]
+
+
+def _layer(plan, layer, x, pending, cos, sin, unpad):
     total, h16, h32 = add_rmsnorm(x, pending, layer.norm1.weight, plan.eps,
                                   want32=layer.lora_q is not None or layer.lora_v is not None)
     residual = total if pending is not None else x
     qkv = nf4_linear(h16, layer.qkv, layer.qkv_bias)
     lq, lv = _lora_out(layer.lora_q, h32, unpad), _lora_out(layer.lora_v, h32, unpad)
     del h32
-    q, k, v = qkv_rope(qkv, lq, lv, cos, sin, plan.nq, plan.nkv, rep, plan.head_dim,
-                       unpad.rope_args() if unpad is not None else None)
-    attn = torch.nn.functional.scaled_dot_product_attention(
-        q, k, v, attn_mask=mask, dropout_p=0.0, scale=layer.scaling,
-        is_causal=mask is None and seq > 1, **({} if rep > 1 else {"enable_gqa": True}))
-    attn = attn.transpose(1, 2).reshape(batch * seq, plan.nq * plan.head_dim)
-    attn = attn.index_select(0, unpad.pidx) if unpad is not None else attn.view(batch, seq, -1)
+    q, k, v = qkv_rope(qkv, lq, lv, cos, sin, unpad.pidx, unpad.seq, plan.nq, plan.nkv,
+                       plan.head_dim)
+    attn = _attention(q, k, v, unpad.lengths, layer.scaling)
     residual, m16, _ = add_rmsnorm(residual, nf4_linear(attn, layer.o), layer.norm2.weight,
                                    plan.eps)
     gate, up = nf4_linear(m16, layer.gate_up)
@@ -166,26 +173,20 @@ def _layer(plan, layer, x, pending, mask, cos, sin, unpad):
 
 
 def decoder_forward(model, plan, input_ids, attention_mask, position_ids):
-    """(last hidden state fp16, unpad) of a labelled training forward: [B, T, H] without padding,
-    else [n, H] for the n real tokens, with `unpad` saying where they sit."""
-    from transformers.masking_utils import create_causal_mask
-
+    """(last hidden state fp16 [n, H] of the n real tokens, unpad) of a labelled training
+    forward, or None for a batch that is not right-padded (the caller then runs HF's forward)."""
     batch, seq = input_ids.shape
-    unpad = None
-    if attention_mask is not None and not bool(attention_mask.all()):
-        unpad = Unpad(attention_mask)
-    # the mask and RoPE helpers read only the shape, dtype and device of the embeddings
-    probe = torch.empty((batch, seq, 1), dtype=torch.float32, device=input_ids.device)
+    unpad = Unpad(attention_mask, batch, seq, input_ids.device)
+    if not unpad.right_padded:
+        return None
     if position_ids is None:
         position_ids = torch.arange(seq, device=input_ids.device).unsqueeze(0)
-    mask = create_causal_mask(config=model.config, inputs_embeds=probe,
-                              attention_mask=attention_mask, past_key_values=None,
-                              position_ids=position_ids)
+    # RoPE's cos/sin as HF computes them; the helper reads only the dtype and device of its input
+    probe = torch.empty((batch, seq, 1), dtype=torch.float32, device=input_ids.device)
     cos, sin = model.rotary_emb(probe, position_ids)
-    ids = input_ids.reshape(-1).index_select(0, unpad.pidx) if unpad is not None else input_ids
-    x, pending = model.embed_tokens(ids), None
+    x, pending = model.embed_tokens(input_ids.reshape(-1).index_select(0, unpad.pidx)), None
     for layer in plan.layers:
-        x, pending = _layer(plan, layer, x, pending, mask, cos, sin, unpad)
+        x, pending = _layer(plan, layer, x, pending, cos, sin, unpad)
     _, hidden, _ = add_rmsnorm(x, pending, plan.final_norm.weight, plan.eps)
     return hidden, unpad
 
