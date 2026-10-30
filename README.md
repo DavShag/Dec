@@ -1,19 +1,19 @@
 # Soup Kernel Challenge: fused QLoRA training on a Kaggle T4
 
 Our `solution/` makes the fixed `soup train` run (Qwen2.5-1.5B-Instruct, NF4, LoRA r=16 on
-q_proj/v_proj, 64 steps on a Kaggle T4) **RESULT_SPEEDUP faster and RESULT_MEMORY lighter**, with
+q_proj/v_proj, 64 steps on a Kaggle T4) **1.53x faster and 4.89x lighter**, with
 the same training: the same batches, the same LoRA dropout masks, the same Soup outputs, and an
-adapter whose held-out loss matches the base run's to RESULT_QUALITY.
+adapter whose held-out loss matches the base run's to -0.002%.
 
-Seven Triton kernels of our own (`@triton.jit`, all in `solution/`) take RESULT_SHARE of the training
+Seven Triton kernels of our own (`@triton.jit`, all in `solution/`) take 12.0% of the training
 time; everything around them is a handful of patches applied by `solution.apply()`.
 
 | Kaggle T4, our run (`harness/run_task.py --repeats 2`) | Base Soup 0.77.0 | Ours | |
 |---|---|---|---|
-| Whole `soup train` (start to saved adapter) | RESULT_BASE_TIME s | RESULT_OUR_TIME s | **RESULT_SPEEDUP** |
-| Peak GPU memory (nvidia-smi) | RESULT_BASE_MEM MiB | RESULT_OUR_MEM MiB | **RESULT_MEMORY** less |
-| Training loop alone (64 steps) | RESULT_BASE_LOOP s | RESULT_OUR_LOOP s | |
-| Held-out loss of the adapter (public rows) | RESULT_BASE_LOSS | RESULT_OUR_LOSS | RESULT_QUALITY |
+| Whole `soup train` (start to saved adapter) | 85.7 s | 56.0 s | **1.53x** |
+| Peak GPU memory (nvidia-smi) | 14,345 MiB | 2,935 MiB | **4.89x** less |
+| Training loop alone (64 steps) | 60.7 s | 33.1 s | |
+| Held-out loss of the adapter (public rows) | 2.04967 | 2.04962 | -0.002% |
 | `harness/check_rules.py` | | all 10 checks pass | |
 
 Links: Kaggle notebook KAGGLE_LINK · final commit COMMIT_LINK
@@ -146,7 +146,7 @@ python harness/check_rules.py
 
 ## Limitations and what we would do next
 
-- About 20 s of the ~RESULT_OUR_TIME s are not training: Python imports, model loading and
+- About 20 s of the ~56.0 s are not training: Python imports, model loading and
   quantization, the trainer's setup, saving. They are the same for the base run, so they cap the
   speedup; we did not touch Soup's loading path.
 - The GEMMs (cuBLAS, ~26 TFLOPS on the T4) are now ~65% of a step. A fused W4A16 GEMM in Triton

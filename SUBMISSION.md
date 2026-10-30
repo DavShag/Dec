@@ -15,13 +15,13 @@
 ## Our kernels
 | Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4) |
 |---|---|---|---|
-| `nf4_dequant_kernel` | `solution/nf4.py` | bitsandbytes `dequantize_4bit` for all 4-bit linears, forward and backward; q\|k\|v and gate\|up in one launch | SHARE_NF4 |
-| `add_rmsnorm_fwd_kernel` | `solution/norm.py` | residual add + Qwen2RMSNorm (7 fp32 kernels) + the casts to fp16 + PEFT's LoRA dropout and cast for q/v | SHARE_NORM_FWD |
-| `add_rmsnorm_bwd_kernel` | `solution/norm.py` | their backward, with both adapters' masked gradients | SHARE_NORM_BWD |
-| `qkv_rope_fwd_kernel` | `solution/rope.py` | bnb output casts, LoRA clone/add, RoPE on q and k, repeat_kv, casts for SDPA | SHARE_ROPE_FWD |
-| `qkv_rope_bwd_kernel` | `solution/rope.py` | their backward | SHARE_ROPE_BWD |
-| `lce_row_kernel` | `solution/lce.py` | lm_head logits + fp32 cross-entropy + TRL's entropy and accuracy + rewind's per-row losses (no logits tensor) | SHARE_LCE |
-| `embed_fp32_kernel` | `solution/integrate.py` | the fp32 embedding lookup (the weight is now stored in fp16) | SHARE_EMBED |
+| `nf4_dequant_kernel` | `solution/nf4.py` | bitsandbytes `dequantize_4bit` for all 4-bit linears, forward and backward; q\|k\|v and gate\|up in one launch | 7.4% |
+| `add_rmsnorm_fwd_kernel` | `solution/norm.py` | residual add + Qwen2RMSNorm (7 fp32 kernels) + the casts to fp16 + PEFT's LoRA dropout and cast for q/v | 1.3% |
+| `add_rmsnorm_bwd_kernel` | `solution/norm.py` | their backward, with both adapters' masked gradients | 1.3% |
+| `qkv_rope_fwd_kernel` | `solution/rope.py` | bnb output casts, LoRA clone/add, RoPE on q and k, repeat_kv, casts for SDPA | 0.5% |
+| `qkv_rope_bwd_kernel` | `solution/rope.py` | their backward | 0.3% |
+| `lce_row_kernel` | `solution/lce.py` | lm_head logits + fp32 cross-entropy + TRL's entropy and accuracy + rewind's per-row losses (no logits tensor) | 1.1% |
+| `embed_fp32_kernel` | `solution/integrate.py` | the fp32 embedding lookup (the weight is now stored in fp16) | <0.1% |
 
 Ideas taken from other work, with links (we wrote the code ourselves):
 - Online softmax: Milakov & Gimelshein, *Online normalizer calculation for softmax*, 2018 —
@@ -41,9 +41,9 @@ Ideas taken from other work, with links (we wrote the code ourselves):
 ## Results on Kaggle T4 (from `runs/result.json` and `runs/checks.json` of the notebook above)
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s | RESULT_BASE_TIME | RESULT_OUR_TIME | speedup RESULT_SPEEDUP |
-| Peak GPU memory, MiB | RESULT_BASE_MEM | RESULT_OUR_MEM | base/ours RESULT_MEMORY |
-| Eval loss (public rows) | RESULT_BASE_LOSS | RESULT_OUR_LOSS | RESULT_QUALITY vs base |
+| Time of `soup train`, s | 85.7 | 56.0 | speedup 1.53x |
+| Peak GPU memory, MiB | 14,345 | 2,935 | base/ours 4.89x |
+| Eval loss (public rows) | 2.04967 | 2.04962 | -0.002% vs base |
 
 - [x] All 10 checks of `harness/check_rules.py` passed
 - [x] README.md rewritten for our solution: what we did, how to run it, results, limits
