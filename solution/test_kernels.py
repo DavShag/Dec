@@ -314,13 +314,23 @@ def _train_step(model, batch, seed):
     return out.loss.detach(), grads
 
 
-@pytest.mark.parametrize("padded,recompute", [(True, False), (False, False), (True, True)])
-def test_fused_training_step_matches_hf(tmp_path, padded, recompute, monkeypatch):
+# keep: everything kept; full: every layer recomputed; mlp: every layer repeats only gate|up;
+# mixed: the first layer recomputed, the second repeats gate|up
+_PLANS = {"keep": None, "full": None, "mlp": lambda layers: (0, layers),
+          "mixed": lambda layers: (1, layers - 1)}
+
+
+@pytest.mark.parametrize("padded,plan", [(True, "keep"), (False, "keep"), (True, "full"),
+                                         (True, "mlp"), (True, "mixed")])
+def test_fused_training_step_matches_hf(tmp_path, padded, plan, monkeypatch):
     import solution
     from solution import decoder
     from solution.integrate import prepare_model
 
-    monkeypatch.setattr(decoder, "ACTIVATION_BUDGET_MB", 0.0 if recompute else 1e9)
+    monkeypatch.setattr(decoder, "ACTIVATION_BUDGET_MB", 0.0 if plan == "full" else 1e9)
+    if _PLANS[plan] is not None:
+        monkeypatch.setattr(decoder.ModelPlan, "recompute_plan",
+                            lambda self, tokens: _PLANS[plan](len(self.layers)))
 
     solution.apply()
     model = _tiny_qlora(tmp_path)
@@ -416,3 +426,88 @@ def test_warmup_compiles_what_training_launches(tmp_path):
     _train_step(model, {"input_ids": ids, "attention_mask": mask, "labels": labels,
                         "use_cache": False}, seed=3)
     assert compiled() == before
+
+
+def _nf4_weights(shapes, seed=0):
+    import bitsandbytes.functional as bnbf
+
+    from solution.nf4 import NF4Weight
+
+    class Param:
+        pass
+
+    torch.manual_seed(seed)
+    out = []
+    for rows, cols in shapes:
+        packed, state = bnbf.quantize_4bit(torch.randn(rows, cols, dtype=torch.float16,
+                                                       device="cuda") * 0.05, blocksize=64,
+                                           compress_statistics=True, quant_type="nf4")
+        param = Param()
+        param.data, param.quant_state = packed, state
+        out.append(NF4Weight(param))
+    return tuple(out)
+
+
+def test_recomputed_mlp_is_the_kept_one_bitwise():
+    """Repeating gate|up in backward forms the same bits as keeping them."""
+    from solution.decoder import RecomputedMLP, SwiGLU
+    from solution.nf4 import nf4_linear
+    from solution.norm import add_rmsnorm
+
+    hidden, inter, n = 256, 640, 77
+    weights = _nf4_weights([(inter, hidden), (inter, hidden)])
+    torch.manual_seed(1)
+    residual = torch.randn(n, hidden, device="cuda")
+    attn_out = (torch.randn(n, hidden, device="cuda") * 2).half()
+    norm_weight = torch.rand(hidden, device="cuda") + 0.5
+    grad = torch.randn(n, inter, device="cuda").half()
+    results = []
+    for recompute in (False, True):
+        x = residual.clone().requires_grad_()
+        delta = attn_out.clone().requires_grad_()
+        total, m16, _, _, _ = add_rmsnorm(x, delta, norm_weight, 1e-6)
+        if recompute:
+            act = RecomputedMLP.apply(m16, total, norm_weight, 1e-6, weights)
+        else:
+            act = SwiGLU.apply(*nf4_linear(m16, weights))
+        act.backward(grad)
+        results.append((act.detach(), x.grad, delta.grad))
+    for kept, repeated in zip(*results):
+        assert torch.equal(kept, repeated)
+
+
+def test_add_rmsnorm_adapters_are_peft_lora_a_bitwise():
+    """The adapters' A GEMMs inside AddRMSNorm (inputs rebuilt in backward) give the bits of
+    PEFT's lora_A(dropout(norm(x))) under fp16 autocast, outputs and every gradient."""
+    from solution.norm import add_rmsnorm
+
+    torch.manual_seed(0)
+    n, hidden, r = 53, 1536, 16
+    pidx = torch.arange(n, device="cuda") * 2  # every other position of a padded batch
+    keep_q = torch.rand(2 * n, hidden, device="cuda") > 0.05
+    keep_v = torch.rand(2 * n, hidden, device="cuda") > 0.05
+    scale = 1.0 / (1.0 - 0.05)
+    x0 = torch.randn(n, hidden, device="cuda")
+    delta0 = (torch.randn(n, hidden, device="cuda") * 3).half()
+    weight = torch.rand(hidden, device="cuda") + 0.5
+    a_q0, a_v0 = (torch.randn(r, hidden, device="cuda") * 0.02 for _ in range(2))
+    g16, gzq, gzv = (torch.randn(n, hidden, device="cuda").half(),
+                     torch.randn(n, r, device="cuda").half(), torch.randn(n, r, device="cuda").half())
+    results = []
+    for fused in (False, True):
+        x, delta = x0.clone().requires_grad_(), delta0.clone().requires_grad_()
+        a_q, a_v = a_q0.clone().requires_grad_(), a_v0.clone().requires_grad_()
+        lora = (keep_q, keep_v, pidx, scale, scale)
+        with torch.autocast("cuda", dtype=torch.float16):
+            if fused:
+                _, y16, _, zq, zv = add_rmsnorm(x, delta, weight, 1e-6, lora=lora,
+                                                adapters=(a_q, a_v))
+            else:
+                _, y16, _, xq, xv = add_rmsnorm(x, delta, weight, 1e-6, lora=lora)
+                zq = torch.nn.functional.linear(xq, a_q)
+                zv = torch.nn.functional.linear(xv, a_v)
+        ((y16.float() * g16.float()).sum() + (zq.float() * gzq.float()).sum()
+         + (zv.float() * gzv.float()).sum()).backward()
+        results.append((zq.detach(), zv.detach(), x.grad, delta.grad, a_q.grad, a_v.grad))
+    for name, peft, ours in zip(("zq", "zv", "dx", "ddelta", "da_q", "da_v"), *results):
+        assert peft.dtype == ours.dtype and torch.equal(peft, ours), name

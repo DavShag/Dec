@@ -5,14 +5,16 @@ q_proj / v_proj, on the padded batch, everything around the GEMMs in separate fp
 on the [n, hidden] rows of the n real tokens:
 
     keep_q, keep_v = dropout masks                        PyTorch's own kernel, base run's RNG order
-    s, h16, xq, xv = add_rmsnorm(residual, pending, keeps)    norm.py: add + RMSNorm + dropout
+    s, h16, zq, zv = add_rmsnorm(residual, pending, keeps, A)  norm.py: add + RMSNorm + dropout,
+                                                              then the adapters' A GEMMs
     qkv            = nf4_linear(h16, [Wq; Wk; Wv], bias)      nf4.py: one dequant launch, one GEMM
-    lq, lv         = LoRA_B(LoRA_A(xq / xv)) * scaling        PEFT's modules, under autocast
+    lq, lv         = LoRA_B(zq / zv) * scaling                PEFT's modules, under autocast
     q, k, v        = qkv_rope(qkv, lq, lv, cos, sin)          rope.py: LoRA add, RoPE, GQA repeat
     attn           = causal SDPA per row                      the padded, masked SDPA's result;
                                                               backward keeps k/v un-repeated
     s2, m16        = add_rmsnorm(s, nf4_linear(attn, Wo))
-    gate, up       = nf4_linear(m16, [Wg; Wu])
+    gate, up       = nf4_linear(m16, [Wg; Wu])                (RecomputedMLP: not kept, repeated
+                                                              in backward from s2)
     pending        = nf4_linear(swiglu(gate, up), Wd)         the residual add moves into the
                                                               next layer's norm kernel
 What stays the same as the base: the 4-bit weights and their values, every fp16 rounding point in
@@ -25,18 +27,21 @@ each norm output, the separate elementwise kernels, and the saved tensors that c
 import math
 
 import torch
+import triton
 from torch.utils.checkpoint import checkpoint
 
-from .nf4 import NF4Weight, nf4_linear, nf4_supported
-from .norm import add_rmsnorm
+from .nf4 import NF4Weight, dequantize_stack, nf4_linear, nf4_supported
+from .norm import add_rmsnorm, rmsnorm16
 from .rope import qkv_rope
-from .swiglu import swiglu
+from .swiglu import BLOCK as SWIGLU_BLOCK, example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
 
 PLAN_ATTR = "_soupk_plan"
-# Saved activations allowed per step; a step that would keep more recomputes its first layers.
-# Chosen from a sweep on the T4 (2400 / 1400 / 900 / 500 MiB): at 1300 the largest batches give up
-# ~2-3% of speed for about a third less peak memory; lower budgets cost more speed than they save.
-ACTIVATION_BUDGET_MB = 1300
+# Saved activations allowed per step; a step that would keep more first drops gate/up of some
+# layers (they repeat the gate|up GEMMs in backward), then recomputes whole leading layers.
+# Kaggle T4, one session: 1300 MiB -> peak 2,831 MiB; 1000 MiB -> 2,551 MiB for ~1.5 s more of the
+# training loop (within the session's noise). 1300 is the faster choice when memory points are
+# already full (README, "Adaptive recomputation").
+ACTIVATION_BUDGET_MB = 1000
 _ATEN = torch.ops.aten
 _EFFICIENT_ATTENTION = all(hasattr(_ATEN, name) for name in (
     "_scaled_dot_product_efficient_attention", "_scaled_dot_product_efficient_attention_backward"))
@@ -57,6 +62,8 @@ def _lora(module):
             or not nf4_supported(module.base_layer)):
         return False
     name = names[0]
+    if module.lora_A[name].bias is not None:  # its GEMM runs inside the norm (AddRMSNorm adapters)
+        return False
     return module.lora_dropout[name], module.lora_A[name], module.lora_B[name], module.scaling[name]
 
 
@@ -102,24 +109,34 @@ class ModelPlan:
         self.final_norm = model.norm
         hidden, inter = config.hidden_size, config.intermediate_size
         q_size, kv_size = self.nq * self.head_dim, self.nkv * self.head_dim
-        # bytes a layer keeps for backward per token: two fp32 norm inputs, two fp16 adapter
-        # inputs and their keep masks packed 8 per byte, q, the distinct k/v heads and the
-        # attention output in fp16, gate and up in fp16
-        self.kept_per_token = (2 * 4 * hidden + 2 * 2 * hidden + 2 * hidden // 8
-                               + 2 * (2 * q_size + 2 * kv_size) + 2 * 2 * inter)
+        # bytes a layer keeps for backward per token: two fp32 norm inputs, the adapters' keep
+        # masks packed 8 per byte (their fp16 inputs are rebuilt, AddRMSNorm adapters), q, the
+        # distinct k/v heads and the attention output in fp16, gate and up in fp16
+        self.kept_per_token = (2 * 4 * hidden + 2 * hidden // 8 + 2 * (2 * q_size + 2 * kv_size)
+                               + 2 * 2 * inter)
+        self.mlp_dropped_per_token = 2 * 2 * inter  # gate and up, for a RecomputedMLP layer
         self.recomputed_per_token = 6 * hidden  # a recomputed layer keeps only its inputs
 
-    def recompute_count(self, tokens):
-        """How many leading layers this step recomputes in backward to stay within the budget.
+    def recompute_plan(self, tokens):
+        """(whole layers recomputed, layers that only repeat gate|up) for a step of `tokens`.
 
-        The peak memory of the run is set by its largest batches, so only those pay for
-        recomputation; shorter batches run without it."""
+        Within the budget a step keeps everything. Above it, layers first drop gate and up
+        (RecomputedMLP: 4 * inter bytes per token for the gate|up GEMMs again, about half of what
+        a whole layer costs to recompute, for two thirds of its bytes); only if every layer has
+        done so and the step is still over budget are leading layers recomputed whole. The peak
+        memory of the run is set by its largest batches, so shorter ones pay little or nothing."""
         layers = len(self.layers)
         excess = tokens * self.kept_per_token * layers - ACTIVATION_BUDGET_MB * 2**20
         if excess <= 0:
-            return 0
-        saved_per_layer = tokens * (self.kept_per_token - self.recomputed_per_token)
-        return min(layers, math.ceil(excess / saved_per_layer))
+            return 0, 0
+        dropped = tokens * self.mlp_dropped_per_token
+        mlp = min(layers, math.ceil(excess / dropped))
+        excess -= mlp * dropped
+        if excess <= 0:
+            return 0, mlp
+        rest = self.kept_per_token - self.mlp_dropped_per_token - self.recomputed_per_token
+        full = min(layers, math.ceil(excess / (tokens * rest)))
+        return full, layers - full
 
     @staticmethod
     def supported(model):
@@ -243,16 +260,77 @@ class CausalAttention(torch.autograd.Function):
         return dq, dk, dv, None, None, None
 
 
-def _layer(plan, layer, x, pending, cos, sin, unpad):
+def _swiglu_out(gate, up):
+    out = torch.empty_like(gate)
+    n = gate.numel()
+    example_swiglu_fwd_kernel[(triton.cdiv(n, SWIGLU_BLOCK),)](gate, up, out, n, BLOCK=SWIGLU_BLOCK)
+    return out
+
+
+def _swiglu_grads_in_place(grad, gate, up):
+    """(dgate, dup) written over gate and up: each element is read before it is written."""
+    grad = grad.reshape(gate.shape).to(torch.float16).contiguous()
+    n = gate.numel()
+    example_swiglu_bwd_kernel[(triton.cdiv(n, SWIGLU_BLOCK),)](grad, gate, up, gate, up, n,
+                                                               BLOCK=SWIGLU_BLOCK)
+    return gate, up
+
+
+class SwiGLU(torch.autograd.Function):
+    """silu(gate) * up with the starter kit's example kernels (swiglu.py), for a gate and up that
+    only this op reads (fresh NF4Linear outputs): backward writes dgate and dup over them, two
+    [tokens, intermediate] buffers fewer at the backward peak, the same values."""
+
+    @staticmethod
+    def forward(ctx, gate, up):
+        ctx.save_for_backward(gate, up)
+        return _swiglu_out(gate, up)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return _swiglu_grads_in_place(grad, *ctx.saved_tensors)
+
+
+class RecomputedMLP(torch.autograd.Function):
+    """silu(gate) * up for [gate, up] = m16 @ [Wg; Wu].T, without keeping gate and up for backward.
+
+    m16 is norm2's output: backward rebuilds it from the fp32 sum norm2 keeps anyway (the same
+    kernel on the same values, so the same bits), repeats the gate|up GEMMs, and then forms
+    exactly what SwiGLU's and NF4Linear's backward form, with the same kernels and GEMMs."""
+
+    @staticmethod
+    def forward(ctx, m16, total, norm_weight, eps, weights):
+        gate, up = nf4_linear(m16, weights)
+        ctx.save_for_backward(total, norm_weight)
+        ctx.eps, ctx.weights = eps, weights
+        return _swiglu_out(gate, up)
+
+    @staticmethod
+    def backward(ctx, grad):
+        total, norm_weight = ctx.saved_tensors
+        flat = rmsnorm16(total, norm_weight, ctx.eps).view(-1, total.shape[-1])
+        dense = dequantize_stack(ctx.weights)  # one buffer for both GEMMs of this backward
+        parts, row = [], 0
+        for w in ctx.weights:
+            parts.append(dense[row:row + w.rows])
+            row += w.rows
+        gate, up = _swiglu_grads_in_place(grad, *(flat @ part.t() for part in parts))
+        grad_m16 = torch.addmm(gate @ parts[0], up, parts[1])  # NF4Linear's backward GEMMs
+        return grad_m16.view(total.shape), None, None, None, None
+
+
+def _layer(plan, layer, x, pending, cos, sin, unpad, recompute_mlp=False):
     p_q, p_v = _dropout_p(layer.lora_q), _dropout_p(layer.lora_v)
     if p_q is not None and p_v is not None:
-        # the q then v masks, in the base run's RNG order; the norm kernel applies them
+        # the q then v masks, in the base run's RNG order; the norm kernel applies them, and runs
+        # the adapters' A GEMMs too, so their fp16 inputs are not kept (AddRMSNorm adapters)
         hidden = x.shape[-1]
         lora = (unpad.keep(p_q, hidden), unpad.keep(p_v, hidden), unpad.pidx, 1.0 / (1.0 - p_q),
                 1.0 / (1.0 - p_v))
-        total, h16, _, xq, xv = add_rmsnorm(x, pending, layer.norm1.weight, plan.eps, lora=lora)
         (_, a_q, b_q, s_q), (_, a_v, b_v, s_v) = layer.lora_q, layer.lora_v
-        lq, lv = b_q(a_q(xq)) * s_q, b_v(a_v(xv)) * s_v  # PEFT's expression, under autocast
+        total, h16, _, zq, zv = add_rmsnorm(x, pending, layer.norm1.weight, plan.eps, lora=lora,
+                                            adapters=(a_q.weight, a_v.weight))
+        lq, lv = b_q(zq) * s_q, b_v(zv) * s_v  # PEFT's expression from lora_A on, under autocast
     else:
         total, h16, h32, _, _ = add_rmsnorm(
             x, pending, layer.norm1.weight, plan.eps,
@@ -266,8 +344,11 @@ def _layer(plan, layer, x, pending, cos, sin, unpad):
     attn = CausalAttention.apply(q, k, v, unpad.lengths, layer.scaling, plan.nq // plan.nkv)
     residual, m16, _, _, _ = add_rmsnorm(residual, nf4_linear(attn, layer.o), layer.norm2.weight,
                                          plan.eps)
-    gate, up = nf4_linear(m16, layer.gate_up)
-    return residual, nf4_linear(swiglu(gate, up), layer.down)
+    if recompute_mlp:
+        act = RecomputedMLP.apply(m16, residual, layer.norm2.weight, plan.eps, tuple(layer.gate_up))
+    else:
+        act = SwiGLU.apply(*nf4_linear(m16, layer.gate_up))
+    return residual, nf4_linear(act, layer.down)
 
 
 def decoder_forward(model, plan, input_ids, attention_mask, position_ids):
@@ -283,16 +364,16 @@ def decoder_forward(model, plan, input_ids, attention_mask, position_ids):
     probe = torch.empty((batch, seq, 1), dtype=torch.float32, device=input_ids.device)
     cos, sin = model.rotary_emb(probe, position_ids)
     x, pending = model.embed_tokens(input_ids.reshape(-1).index_select(0, unpad.pidx)), None
-    recompute = plan.recompute_count(unpad.pidx.numel())
+    full, mlp = plan.recompute_plan(unpad.pidx.numel())
     for index, layer in enumerate(plan.layers):
-        if index < recompute:
+        if index < full:
             # our own recomputation (allowed by the task; Soup's gradient_checkpointing stays off):
             # backward reruns this layer from its inputs; the RNG state is restored for the
             # rerun, so its dropout masks are the ones drawn now
             x, pending = checkpoint(_layer, plan, layer, x, pending, cos, sin, unpad,
                                     use_reentrant=False, preserve_rng_state=True)
-        else:
-            x, pending = _layer(plan, layer, x, pending, cos, sin, unpad)
+        else:  # the next `mlp` layers repeat only their gate|up GEMMs in backward
+            x, pending = _layer(plan, layer, x, pending, cos, sin, unpad, index < full + mlp)
     _, hidden, _, _, _ = add_rmsnorm(x, pending, plan.final_norm.weight, plan.eps)
     return hidden, unpad
 

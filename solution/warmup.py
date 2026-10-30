@@ -69,8 +69,8 @@ def _compile_all(dims):
     swiglu.example_swiglu_bwd_kernel.warmup(f16, f16, f16, f16, f16, 8960 * 16,
                                             BLOCK=swiglu.BLOCK, grid=GRID)
     norm.add_rmsnorm_bwd_kernel.warmup(
-        f32, f32, f32, f16, f32, f32, f16, f16, u8, f32, f16, hidden, 1.05, 1.05, 1, 0, 1, 1, 1,
-        BLOCK_H=block_h, num_warps=8, grid=GRID)
+        f32, f32, f32, f16, f32, f32, f16, f16, u8, f16, f16, f32, f16, hidden, 1.05, 1.05, 1, 0, 1,
+        1, 1, 1, BLOCK_H=block_h, num_warps=8, grid=GRID)
 
 def _run():
     try:

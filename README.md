@@ -84,8 +84,11 @@ dropout kernel, drawn on a tensor of the same shape and dtype as in the base run
 order, so they are the same masks (verified: the gradients match the HF/PEFT step to 1e-3, while a
 different dropout draw moves them by ~50%). The kernel also packs the row's two masks 8 per byte,
 and only those are kept for backward: 384 bytes per real token and layer instead of two bool masks
-over every padded position (~5 KB per token at this task's 43% padding). Backward rebuilds x̂ from
-the saved fp32 input and 1/rms and adds both adapters' masked gradients in fp32.
+over every padded position (~5 KB per token at this task's 43% padding). The adapters' A GEMMs
+(fp16, as PEFT's `lora_A` runs them under autocast) run in the same autograd function, so their
+fp16 inputs are not kept either: backward writes them again from the saved input, 1/rms and masks
+for the A gradients (bitwise PEFT's outputs and gradients, tested). Backward rebuilds x̂ from the
+saved fp32 input and 1/rms and adds both adapters' masked gradients in fp32.
 *Derivation:* Liger Kernel's RMSNorm backward (Hsu et al. 2024).
 
 ### 5. q/k/v epilogue (`rope.py`, `qkv_rope_fwd_kernel` / `_bwd_kernel`)
@@ -109,22 +112,29 @@ backward keeps only the 2 distinct kv heads and repeats them again when it runs,
 
 ### 7. Adaptive recomputation (`decoder.py`)
 Peak memory is set by the largest batch only. Each step estimates the activations it would keep
-(from the model dimensions and its token count) and, if they exceed a budget, recomputes just
-enough of the first layers in backward (`torch.utils.checkpoint`, our own code: Soup's
-`gradient_checkpointing` stays off). The RNG state is restored for the recomputation, so the
-recomputed layers draw the same dropout masks. Short batches pay nothing.
+(from the model dimensions and its token count: 55,680 bytes per token and layer) and, if they
+exceed a budget, gives up just enough of them, cheapest bytes first (our own code: Soup's
+`gradient_checkpointing` stays off):
+1. layers drop gate and up, 35,840 of those bytes (`RecomputedMLP`): backward rebuilds the norm's
+   fp16 output from the fp32 sum the norm keeps anyway and repeats the gate|up GEMMs, about half
+   the work of recomputing the layer for two thirds of its bytes; the same bits as keeping them
+   (tested);
+2. only if every layer has done so, leading layers are recomputed whole (`torch.utils.checkpoint`,
+   with the RNG state restored, so they draw the same dropout masks).
 
-How the budget was chosen (one Kaggle session, base 85.0 s / 14,345 MiB):
+Short batches pay nothing. The two budgets we weighed, one Kaggle session (base 86.6 s /
+14,345 MiB), two solution runs each:
 
-| Activation budget | `soup train` | Peak GPU memory | Speed / memory vs base |
-|---|---|---|---|
-| 2400 MiB | 55.6 s | 4,055 MiB | 1.53x / 3.54x |
-| 1400 MiB | 57.0 s | 3,035 MiB | 1.49x / 4.73x |
-| 900 MiB | 60.6 s | 2,495 MiB | 1.40x / 5.75x |
-| 500 MiB | 64.5 s | 2,143 MiB | 1.32x / 6.69x |
+| Activation budget | `soup train` | Training loop | Peak GPU memory | Speed / memory vs base |
+|---|---|---|---|---|
+| 1300 MiB | 47.8 / 51.0 s | 28.5 / 31.6 s | 2,831 MiB | 1.75x / 5.07x |
+| 1000 MiB | 50.8 / 51.2 s | 31.6 / 31.6 s | 2,551 MiB | 1.70x / 5.62x |
 
-The score is logarithmic in both ratios, so from 2400 to ~1400 memory gains far outweigh the speed
-lost, and below that they stop doing so (unless the fastest team is above ~2x). We use 1300.
+The peak is exact (it follows the budget); the time is not: the two runs at 1300 differ by 3 s,
+about what 1000 costs over 1300 (~1.5 s of the training loop by the averages). The score is
+logarithmic in both ratios and relative to the best team, so the choice depends on the others: if
+another team's memory is better than ours, 1000 gains more on memory than it loses on speed; if
+ours is the best, memory points are full either way and 1300 is the faster run. We use 1000.
 
 ### 8. Compile warm-up (`warmup.py`)
 Every measured run starts with an empty Triton cache, and compilation counts. A background thread
@@ -151,11 +161,13 @@ it does not count toward our share.
 
 ## How we checked it
 
-- `python -m pytest solution -q` (21 tests, on a GPU): each kernel against plain PyTorch, forward
+- `python -m pytest solution -q` (25 tests, on a GPU): each kernel against plain PyTorch, forward
   and backward (NF4 bit-exact vs bitsandbytes; norm, RoPE epilogue, fused head with padding, real
   vocabulary and the fp16 loss scale; attention against the SDPA call it replaces), plus whole
   training steps of a small 4-bit Qwen2 with PEFT LoRA against transformers + peft + bitsandbytes
-  (padded / unpadded / recomputed): loss within 2e-6 relative, LoRA gradients within 5e-3; and a
+  (padded / unpadded / gate|up repeated / whole layers recomputed / both): loss within 2e-6
+  relative, LoRA gradients within 5e-3; bitwise: the repeated gate|up against the kept one, the
+  adapters' A inside the norm against PEFT's `lora_A`; and a
   check that the warm-up compiles exactly the kernel variants a training step launches; the
   startup patches: bf16 → fp16 on the GPU is bitwise the CPU conversion (edge values included), and
   an in-memory map gives the same rows without hashing its function.
@@ -207,7 +219,7 @@ python harness/check_rules.py
 |---|---|
 | `solution/__init__.py` | `apply()` |
 | `solution/integrate.py` | patches: model setup (fp16 embedding), causal-LM forward, TRL compute_loss |
-| `solution/decoder.py` | the fused decoder stack, unpadding, adaptive recomputation |
+| `solution/decoder.py` | the fused decoder stack, unpadding, attention, adaptive recomputation (gate\|up first, then whole layers) |
 | `solution/lce.py` | fused head + loss + metrics |
 | `solution/nf4.py`, `norm.py`, `rope.py` | dequantization, add+RMSNorm+dropout, q/k/v epilogue |
 | `solution/warmup.py` | background compilation |

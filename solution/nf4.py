@@ -108,38 +108,35 @@ def dequantize_stack(weights):
 class NF4Linear(torch.autograd.Function):
     """y_i = x @ W_i.T (+ bias for the single-output case) for frozen NF4 weights W_i sharing x.
 
-    One output: one GEMM. Several outputs (gate|up): one dequantize buffer, a GEMM per output
-    into its own contiguous tensor, and backward accumulates the input gradient over them."""
+    One output: one GEMM. Several outputs (gate|up): a GEMM per output into its own contiguous
+    tensor, each weight dequantized just before its GEMM (one 27.5 MB buffer alive, not a 55 MB
+    one for both), and backward accumulates the input gradient over them."""
 
     @staticmethod
     @torch.autocast("cuda", enabled=False)
     def forward(ctx, x, weights, bias):
         flat = x.reshape(-1, x.shape[-1]).to(torch.float16)
-        dense = dequantize_stack(weights)
         ctx.weights, ctx.in_shape, ctx.in_dtype = weights, x.shape, x.dtype
         if len(weights) == 1 or bias is not None:
+            dense = dequantize_stack(weights)
             out = torch.addmm(bias, flat, dense.t()) if bias is not None else flat @ dense.t()
             return out.view(*x.shape[:-1], out.shape[-1])
-        outs, row = [], 0
-        for w in weights:
-            outs.append((flat @ dense[row:row + w.rows].t()).view(*x.shape[:-1], w.rows))
-            row += w.rows
-        return tuple(outs)
+        return tuple((flat @ dequantize_stack([w]).t()).view(*x.shape[:-1], w.rows)
+                     for w in weights)
 
     @staticmethod
     @torch.autocast("cuda", enabled=False)
     def backward(ctx, *grads):
-        dense = dequantize_stack(ctx.weights)
         if len(grads) == 1:
+            dense = dequantize_stack(ctx.weights)
             grad = grads[0].reshape(-1, dense.shape[0]).to(torch.float16)
             grad_x = grad @ dense
         else:
-            grad_x, row = None, 0
+            grad_x = None
             for w, g in zip(ctx.weights, grads):
-                part = dense[row:row + w.rows]
-                row += w.rows
                 if g is None:
                     continue
+                part = dequantize_stack([w])
                 g = g.reshape(-1, w.rows).to(torch.float16)
                 grad_x = g @ part if grad_x is None else torch.addmm(grad_x, g, part)
         return grad_x.view(ctx.in_shape).to(ctx.in_dtype), None, None
