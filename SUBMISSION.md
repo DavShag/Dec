@@ -41,9 +41,9 @@ Ideas taken from other work, with links (we wrote the code ourselves):
 ## Results on Kaggle T4 (from `runs/result.json` and `runs/checks.json` of the notebook above)
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s | 85.7 | 56.0 | speedup 1.53x |
+| Time of `soup train`, s | 86.1 | 54.8 | speedup 1.57x |
 | Peak GPU memory, MiB | 14,345 | 2,935 | base/ours 4.89x |
-| Eval loss (public rows) | 2.04967 | 2.04962 | -0.002% vs base |
+| Eval loss (public rows) | 2.04963 | 2.04961 | -0.001% vs base |
 
 - [x] All 10 checks of `harness/check_rules.py` passed
 - [x] README.md rewritten for our solution: what we did, how to run it, results, limits
