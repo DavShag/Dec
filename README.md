@@ -134,7 +134,7 @@ The peak is exact (it follows the budget); the time is not: the two runs at 1300
 about what 1000 costs over 1300 (~1.5 s of the training loop by the averages). The score is
 logarithmic in both ratios and relative to the best team, so the choice depends on the others: if
 another team's memory is better than ours, 1000 gains more on memory than it loses on speed; if
-ours is the best, memory points are full either way and 1300 is the faster run. We use 1000.
+ours is the best, memory points are full either way and 1300 is the faster run. We use 1300.
 
 ### 8. Compile warm-up (`warmup.py`)
 Every measured run starts with an empty Triton cache, and compilation counts. A background thread
