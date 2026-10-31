@@ -83,6 +83,8 @@ def prepare_model(model):
         return False
     if embed.weight.requires_grad:
         return False
+    if any(param.device != head.weight.device for param in causal.parameters()):
+        return False  # spread over devices (no CUDA_VISIBLE_DEVICES on a multi-GPU machine)
     if embed.weight.dtype == torch.float32:
         embed.weight.data = embed.weight.data.to(torch.float16).contiguous()
         embed.forward = types.MethodType(_embedding_fp32_forward, embed)
