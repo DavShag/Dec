@@ -253,7 +253,8 @@ def test_causal_attention_matches_sdpa():
     v = torch.randn(n, nkv, d, device="cuda").half().repeat_interleave(group, 1).requires_grad_()
     grad = torch.randn(n, nq * d, device="cuda").half()
 
-    out = CausalAttention.apply(q, k, v, lengths, scale, group)
+    offsets = torch.tensor([0] + lengths, device="cuda").cumsum(0).to(torch.int32)
+    out = CausalAttention.apply(q, k, v, (offsets, max(lengths)), scale, group)
     _, k_kept, v_kept, *_ = out.grad_fn.saved_tensors
     assert k_kept.shape == v_kept.shape == (n, nkv, d)  # k/v kept un-repeated for backward
     out.backward(grad)
@@ -429,7 +430,8 @@ def test_warmup_compiles_what_training_launches(tmp_path, monkeypatch):
     for kernel in kernels:  # forget what earlier tests compiled: only the warm-up's variants
         kernel.device_caches.clear()
     # _tiny_qlora's hidden, vocab, heads, kv heads, head_dim
-    warmup._compile_all((256, 1024, 4, 2, 64), warmup._build_launcher)
+    warmup._compile_all((256, 1024, 4, 2, 64), lambda kernel, *args, **kwargs:
+                        warmup._build_launcher(kernel.warmup(*args, **kwargs)))
     before = compiled()
     assert c_builds  # the warm-up built the launchers (kernels of one signature share one)
     c_builds.clear()

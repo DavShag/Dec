@@ -20,6 +20,15 @@ Avoidable in `apply()`'s imports of Soup's libraries (`library_imports`), and at
   every installed distribution (hundreds on Kaggle's image). transformers' import, in the
   harness, made the same call moments earlier in the same environment and keeps the result
   (read-only); while trl imports, the call returns a copy of it.
+- bitsandbytes wraps its CPU fallback ops in `torch.compile` at import, which imports most of
+  Inductor for functions a CUDA run never calls; while it imports, `torch.compile` defers each
+  compile to the function's first call.
+- transformers imports scikit-learn and SciPy (`_UNUSED_HERE`) for assisted generation, GLUE
+  metrics and object-detection losses; those modules stand in as ones that import themselves
+  when one of the names transformers took from them is called.
+- trl and transformers import wandb when it is installed; a run without W&B reporting only reads
+  `wandb.run`, None until `wandb.init()`. wandb stands in as a module with that one answer until
+  something else of it is used, which imports it.
 - Python's cyclic garbage collector: the libraries import ~500k objects (modules, classes,
   functions) that live until the process exits. While they import, every full collection walks
   all of them, and the interpreter's shutdown walks them again in several passes (~0.8 s of the
@@ -35,7 +44,12 @@ import atexit
 import contextlib
 import functools
 import gc
+import importlib
+import importlib.machinery
+import importlib.util
 import inspect
+import sys
+import types
 
 import torch
 
@@ -134,13 +148,127 @@ def _known_package_mapping():
 
 
 @contextlib.contextmanager
+def _compile_on_first_call():
+    """torch.compile(fn) returns fn compiled when it is first called, not where it is decorated."""
+    original = torch.compile
+
+    def compile(model=None, **options):  # noqa: A001 - stands in for torch.compile
+        if model is None:  # @torch.compile(...)
+            return lambda fn: compile(fn, **options)
+        if isinstance(model, torch.nn.Module) or not callable(model):
+            return original(model, **options)
+        compiled = None
+
+        @functools.wraps(model)
+        def first_call_compiles(*args, **kwargs):
+            nonlocal compiled
+            if compiled is None:
+                compiled = original(model, **options)
+            return compiled(*args, **kwargs)
+
+        return first_call_compiles
+
+    torch.compile = compile
+    try:
+        yield
+    finally:
+        torch.compile = original
+
+
+def _import_bitsandbytes():
+    """bitsandbytes' import wraps its CPU fallback ops in torch.compile, which imports most of
+    Inductor right away (~1 s on Kaggle's CPU) for functions a CUDA run never calls: import it
+    with torch.compile deferring each compile to the function's first call (same function, same
+    fallback to the plain one if compiling fails, which bitsandbytes' own wrapper handles)."""
+    if "bitsandbytes" in sys.modules:
+        return
+    with _compile_on_first_call():
+        import bitsandbytes  # noqa: F401
+
+
+class _ImportedOnUse(types.ModuleType):
+    """Stands in `sys.modules` for a module until it is used, then imports the real module (which
+    takes its place) and answers from it. `deferred` are the names a `from <module> import ...`
+    binds before any use: they become functions that import the module when called. `unimported`
+    are attributes with a known value for as long as the real module has not been imported."""
+
+    def __init__(self, name, deferred=(), unimported=None):
+        super().__init__(name)
+        self._unimported = dict(unimported or {})
+        # find_spec(name) returns a loaded module's spec; one that exists, so it finds a module
+        self.__spec__ = importlib.machinery.ModuleSpec(name, None)
+        for attr in deferred:
+            setattr(self, attr, self._deferred(attr))
+
+    def _real(self):
+        if sys.modules.get(self.__name__) is self:
+            del sys.modules[self.__name__]
+        return importlib.import_module(self.__name__)
+
+    def __getattr__(self, attr):
+        if attr.startswith("__"):  # the import system's probes (__path__, ...): a plain module
+            raise AttributeError(attr)
+        if attr in self._unimported and sys.modules.get(self.__name__) in (None, self):
+            return self._unimported[attr]
+        return getattr(self._real(), attr)
+
+    def _deferred(self, attr):
+        def call(*args, **kwargs):
+            return getattr(self._real(), attr)(*args, **kwargs)
+
+        call.__name__ = call.__qualname__ = attr
+        return call
+
+
+# Modules transformers imports at its own import when their package is installed (Kaggle's image
+# has scikit-learn and SciPy), with the names it binds there, for features a training run does
+# not use: assisted generation (roc_curve), the GLUE metrics of transformers.data (f1_score,
+# matthews_corrcoef, pearsonr, spearmanr), the object-detection losses (linear_sum_assignment).
+# ~1.5 s of imports on Kaggle's CPU.
+_UNUSED_HERE = {
+    "sklearn.metrics": ("roc_curve", "f1_score", "matthews_corrcoef"),
+    "scipy.stats": ("pearsonr", "spearmanr"),
+    "scipy.optimize": ("linear_sum_assignment",),
+}
+
+
+@contextlib.contextmanager
+def _unused_modules_on_use():
+    """While apply() imports, each module of _UNUSED_HERE stands in as one whose names import the
+    real module when called (any other use imports it at once)."""
+    standing = {}
+    for name, deferred in _UNUSED_HERE.items():
+        if name not in sys.modules and importlib.util.find_spec(name.split(".")[0]) is not None:
+            standing[name] = sys.modules[name] = _ImportedOnUse(name, deferred=deferred)
+    try:
+        yield
+    finally:
+        for name, stand_in in standing.items():
+            if sys.modules.get(name) is stand_in:
+                del sys.modules[name]  # its names keep working: each imports on its first call
+
+
+def _wandb_on_use():
+    """trl's trainers import wandb when it is installed (Kaggle's image has it: ~0.35 s), and
+    transformers' is_wandb_available() imports it to check: for a run that does not report to
+    W&B (Soup's report_to is "none") only `wandb.run` is ever read, in TRL's model card at a
+    checkpoint, and it is None until wandb.init(), which needs the real module. wandb stands in as
+    a module whose `run` is None until the real module is imported; any other use imports it."""
+    if "wandb" not in sys.modules and importlib.util.find_spec("wandb") is not None:
+        sys.modules["wandb"] = _ImportedOnUse("wandb", unimported={"run": None})
+
+
+@contextlib.contextmanager
 def library_imports():
-    """`apply()`'s imports: the collector paused and trl handed the known package mapping; what
-    they created is then frozen, and the exit collects once, then freezes the rest."""
+    """`apply()`'s imports: the collector paused, trl handed the known package mapping,
+    bitsandbytes' compiles, scikit-learn, SciPy and wandb deferred; what they created is then
+    frozen, and the exit collects once, then freezes the rest."""
     enabled = gc.isenabled()
     gc.disable()
     try:
-        with _known_package_mapping():
+        _import_bitsandbytes()
+        _wandb_on_use()
+        with _known_package_mapping(), _unused_modules_on_use():
             yield
     finally:
         gc.freeze()

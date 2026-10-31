@@ -10,7 +10,7 @@ on the [n, hidden] rows of the n real tokens:
     qkv            = nf4_linear(h16, [Wq; Wk; Wv], bias)      nf4.py: one dequant launch, one GEMM
     lq, lv         = LoRA_B(zq / zv) * scaling                PEFT's modules, under autocast
     q, k, v        = qkv_rope(qkv, lq, lv, cos, sin)          rope.py: LoRA add, RoPE, GQA repeat
-    attn           = causal SDPA per row                      the padded, masked SDPA's result;
+    attn           = causal SDPA of every row, one call       the padded, masked SDPA's result;
                                                               backward keeps k/v un-repeated
     s2, m16        = add_rmsnorm(s, nf4_linear(attn, Wo))
     gate, up       = nf4_linear(m16, [Wg; Wu])                (RecomputedMLP: not kept, repeated
@@ -44,7 +44,7 @@ PLAN_ATTR = "_soupk_plan"
 ACTIVATION_BUDGET_MB = 1300
 _ATEN = torch.ops.aten
 _EFFICIENT_ATTENTION = all(hasattr(_ATEN, name) for name in (
-    "_scaled_dot_product_efficient_attention", "_scaled_dot_product_efficient_attention_backward"))
+    "_efficient_attention_forward", "_efficient_attention_backward"))
 
 
 def _base(module):
@@ -155,10 +155,10 @@ class Unpad:
     """The real tokens of a right-padded batch: every op runs on these rows only.
 
     Removing padding inside a batch is allowed by the task; rows of different batches are never
-    mixed. Attention runs per row with is_causal (the memory-efficient SDPA kernel then skips the
-    blocks above the diagonal), which for right padding is exactly what the base run's padded,
-    masked SDPA computes for the real tokens, at a fraction of the work. Packing variable-length
-    rows this way follows FlashAttention-2's varlen interface (Dao 2023)."""
+    mixed. Attention runs on each row's tokens, causally (the memory-efficient SDPA kernel then
+    skips the blocks above the diagonal), which for right padding is exactly what the base run's
+    padded, masked SDPA computes for the real tokens, at a fraction of the work. Packing
+    variable-length rows this way follows FlashAttention-2's varlen interface (Dao 2023)."""
 
     def __init__(self, attention_mask, batch, seq, device):
         steps = torch.arange(seq, device=device)
@@ -171,6 +171,9 @@ class Unpad:
         self.batch, self.seq = batch, seq
         self.pidx = (steps < lengths[:, None]).reshape(-1).nonzero().squeeze(1)
         self.lengths = lengths.tolist()
+        # where each row starts among the real tokens, for attention (computed on the GPU: no copy)
+        offsets = torch.nn.functional.pad(lengths.cumsum(0), (1, 0)).to(torch.int32)
+        self.rows = (offsets, max(self.lengths))
         self.ones = None
 
     def keep(self, p, hidden):
@@ -208,56 +211,41 @@ def _lora_out(parts, x32, unpad):
     return lora_b(lora_a(dropped)) * scaling  # PEFT's own expression, under autocast
 
 
-def _heads_first(rows):
-    """Token-major [L, heads, head_dim] rows as SDPA's [1, heads, L, head_dim] (a view)."""
-    return rows.transpose(0, 1)[None]
-
-
 class CausalAttention(torch.autograd.Function):
-    """Causal SDPA per row on [n, heads, head_dim] rows; [n, heads * head_dim] out.
+    """Causal attention of every row's real tokens in one call: [n, heads, head_dim] q, k, v
+    (token-major, rows one after the other) -> [n, heads * head_dim].
 
-    The memory-efficient kernel that `scaled_dot_product_attention` runs on sm75, called directly,
-    row by row, with the same inputs: the same outputs and gradients. k and v come repeated to every
-    query head (rope.py; the kernel has no grouped-query mode). Backward keeps only their distinct
-    kv heads and repeats them again when it runs, so the k/v saved per token shrink by nq / nkv."""
+    The memory-efficient kernel that `scaled_dot_product_attention` runs on sm75, called with the
+    rows' offsets among the n tokens (FlashAttention-2's varlen interface, which the kernel takes
+    as cu_seqlens): each row attends causally to its own tokens only, which for right padding is
+    what the base run's padded, masked SDPA computes for the real tokens. One launch per layer and
+    direction for the whole batch, the output and gradients written in place. k and v come
+    repeated to every query head (rope.py; the kernel has no grouped-query mode). Backward keeps
+    only their distinct kv heads and repeats them again when it runs, so the k/v saved per token
+    shrink by nq / nkv."""
 
     @staticmethod
-    def forward(ctx, q, k, v, lengths, scale, group):
-        outs, stats, start = [], [], 0
-        for length in lengths:
-            rows = slice(start, start + length)
-            out, lse, seed, offset = _ATEN._scaled_dot_product_efficient_attention(
-                _heads_first(q[rows]), _heads_first(k[rows]), _heads_first(v[rows]), None, True,
-                0.0, length > 1, scale=scale)
-            outs.append(out[0].transpose(0, 1).reshape(length, -1))
-            stats += [lse, seed, offset]
-            start += length
-        out = torch.cat(outs) if len(outs) > 1 else outs[0]
-        ctx.save_for_backward(q, k[:, ::group].contiguous(), v[:, ::group].contiguous(), out,
-                              *stats)
-        ctx.lengths, ctx.scale, ctx.group = lengths, scale, group
+    def forward(ctx, q, k, v, rows, scale, group):
+        offsets, longest = rows
+        out, lse, seed, offset, _, _ = _ATEN._efficient_attention_forward(
+            q[None], k[None], v[None], None, offsets, offsets, longest, longest, 0.0, 1, True,
+            scale=scale)  # mask type 1: causal, as SDPA's is_causal
+        out = out[0].view(q.shape[0], -1)
+        ctx.save_for_backward(q, k[:, ::group].contiguous(), v[:, ::group].contiguous(), out, lse,
+                              seed, offset, offsets)
+        ctx.longest, ctx.scale, ctx.group = longest, scale, group
         return out
 
     @staticmethod
     def backward(ctx, grad):
-        q, k_kv, v_kv, out, *stats = ctx.saved_tensors
+        q, k_kv, v_kv, out, lse, seed, offset, offsets = ctx.saved_tensors
         k, v = (t.repeat_interleave(ctx.group, dim=1) for t in (k_kv, v_kv))
-        grad = grad.contiguous()
-        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-        heads, head_dim = q.shape[1:]
-        start = 0
-        for index, length in enumerate(ctx.lengths):
-            rows = slice(start, start + length)
-            lse, seed, offset = stats[3 * index:3 * index + 3]
-            grads = _ATEN._scaled_dot_product_efficient_attention_backward(
-                _heads_first(grad[rows].view(length, heads, head_dim)), _heads_first(q[rows]),
-                _heads_first(k[rows]), _heads_first(v[rows]), None,
-                _heads_first(out[rows].view(length, heads, head_dim)), lse, seed, offset, 0.0,
-                [True, True, True, False], length > 1, scale=ctx.scale)
-            for target, part in zip((dq, dk, dv), grads):
-                target[rows] = part[0].transpose(0, 1)
-            start += length
-        return dq, dk, dv, None, None, None
+        tokens = (1,) + q.shape
+        dq, dk, dv, _ = _ATEN._efficient_attention_backward(
+            grad.contiguous().view(tokens), q[None], k[None], v[None], None, out.view(tokens),
+            offsets, offsets, ctx.longest, ctx.longest, lse, 0.0, seed, offset, 1, False,
+            scale=ctx.scale)
+        return dq[0], dk[0], dv[0], None, None, None
 
 
 def _swiglu_out(gate, up):
@@ -341,7 +329,7 @@ def _layer(plan, layer, x, pending, cos, sin, unpad, recompute_mlp=False):
     qkv = nf4_linear(h16, layer.qkv, layer.qkv_bias)
     q, k, v = qkv_rope(qkv, lq, lv, cos, sin, unpad.pidx, unpad.seq, plan.nq, plan.nkv,
                        plan.head_dim)
-    attn = CausalAttention.apply(q, k, v, unpad.lengths, layer.scaling, plan.nq // plan.nkv)
+    attn = CausalAttention.apply(q, k, v, unpad.rows, layer.scaling, plan.nq // plan.nkv)
     residual, m16, _, _, _ = add_rmsnorm(residual, nf4_linear(attn, layer.o), layer.norm2.weight,
                                          plan.eps)
     if recompute_mlp:

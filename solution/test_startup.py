@@ -67,3 +67,81 @@ def test_library_imports_pause_the_collector_and_freeze_what_they_created():
     assert gc.isenabled()
     assert gc.get_freeze_count() >= frozen_before + len(made)
     gc.unfreeze()  # leave the test process as it was
+
+
+def test_compile_waits_for_the_first_call(monkeypatch):
+    from solution.startup import _compile_on_first_call
+
+    compiles = []
+
+    def fake_compile(model=None, **options):  # stands in for the real torch.compile
+        compiles.append((model, options))
+        return lambda *args, **kwargs: ("compiled", model(*args, **kwargs))
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    with _compile_on_first_call():
+        @torch.compile(dynamic=False)
+        def double(x):
+            return 2 * x
+
+        plain = torch.compile(lambda x: x + 1)
+        module = torch.nn.Linear(2, 2)
+        torch.compile(module)  # a module compiles as before, at once
+        assert [c[0] for c in compiles] == [module]
+    assert torch.compile is fake_compile
+    assert double(3) == ("compiled", 6) and double(4) == ("compiled", 8)
+    assert plain(1) == ("compiled", 2)
+    assert [(c[0].__name__, c[1]) for c in compiles[1:]] == [("double", {"dynamic": False}),
+                                                            ("<lambda>", {})]
+
+
+def test_a_module_standing_in_imports_the_real_one_when_used(tmp_path, monkeypatch):
+    import sys
+
+    from solution.startup import _ImportedOnUse
+
+    package = tmp_path / "standin_pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "metrics.py").write_text("def roc_curve(y, s):\n    return ('roc', y, s)\n\n"
+                                        "def other():\n    return 'other'\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.modules["standin_pkg.metrics"] = _ImportedOnUse("standin_pkg.metrics",
+                                                        deferred=("roc_curve",))
+    try:
+        from standin_pkg.metrics import roc_curve  # what transformers runs at its import
+
+        assert "standin_pkg" not in sys.modules  # nothing imported yet
+        assert roc_curve(1, 2) == ("roc", 1, 2)  # the call imports the real module
+        import standin_pkg.metrics as real
+
+        assert not isinstance(real, _ImportedOnUse) and real.other() == "other"
+        assert roc_curve(3, 4) == ("roc", 3, 4)
+    finally:
+        for name in ("standin_pkg.metrics", "standin_pkg"):
+            sys.modules.pop(name, None)
+
+
+def test_wandb_standing_in_answers_run_until_imported(tmp_path, monkeypatch):
+    import importlib.util
+    import sys
+
+    from solution.startup import _ImportedOnUse
+
+    package = tmp_path / "standin_wb"
+    package.mkdir()
+    (package / "__init__.py").write_text("run = 'a real run'\n\ndef init():\n    return 'init'\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    stand_in = _ImportedOnUse("standin_wb", unimported={"run": None})
+    sys.modules["standin_wb"] = stand_in
+    try:
+        assert importlib.util.find_spec("standin_wb") is not None  # what is_wandb_available runs
+        import standin_wb
+
+        assert standin_wb.run is None and "standin_wb" in sys.modules
+        assert sys.modules["standin_wb"] is stand_in  # still not imported
+        assert standin_wb.init() == "init"  # any other use imports the real module
+        assert sys.modules["standin_wb"] is not stand_in
+        assert standin_wb.run == "a real run"  # and from then on answers from it
+    finally:
+        sys.modules.pop("standin_wb", None)
