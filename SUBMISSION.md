@@ -15,12 +15,12 @@
 ## Our kernels
 | Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4) |
 |---|---|---|---|
-| `nf4_dequant_kernel` | `solution/nf4.py` | bitsandbytes `dequantize_4bit` for all 4-bit linears, forward and backward (and the gate\|up repeated in backward); q\|k\|v in one launch | 8.1% |
-| `add_rmsnorm_fwd_kernel` | `solution/norm.py` | residual add + Qwen2RMSNorm (7 fp32 kernels) + the casts to fp16 + PEFT's LoRA dropout and cast for q/v, keep masks packed 8 per byte | 1.3% |
-| `add_rmsnorm_bwd_kernel` | `solution/norm.py` | their backward, with both adapters' masked gradients; writes the adapters' fp16 inputs again for the LoRA A gradients | 1.6% |
-| `qkv_rope_fwd_kernel` | `solution/rope.py` | bnb output casts, LoRA clone/add, RoPE on q and k, repeat_kv, casts for SDPA | 0.5% |
-| `qkv_rope_bwd_kernel` | `solution/rope.py` | their backward | 0.4% |
-| `lce_row_kernel` | `solution/lce.py` | lm_head logits + fp32 cross-entropy + TRL's entropy and accuracy + rewind's per-row losses (no logits tensor) | 1.2% |
+| `nf4_dequant_kernel` | `solution/nf4.py` | bitsandbytes `dequantize_4bit` for all 4-bit linears, forward and backward (and the gate\|up repeated in backward); q\|k\|v and gate\|up in one launch each, into one scratch buffer | 6.7% |
+| `add_rmsnorm_fwd_kernel` | `solution/norm.py` | residual add + Qwen2RMSNorm (7 fp32 kernels) + the casts to fp16 + PEFT's LoRA dropout and cast for q/v, keep masks packed 8 per byte | 1.2% |
+| `add_rmsnorm_bwd_kernel` | `solution/norm.py` | their backward, with both adapters' masked gradients; writes the adapters' fp16 inputs again for the LoRA A gradients; forms the second norm's input again from the layer's input and the fp16 o_proj output it keeps instead | 1.4% |
+| `qkv_rope_fwd_kernel` | `solution/rope.py` | bnb output casts, LoRA clone/add, RoPE on q and k, repeat_kv, casts for SDPA | 0.4% |
+| `qkv_rope_bwd_kernel` | `solution/rope.py` | their backward | 0.3% |
+| `lce_row_kernel` | `solution/lce.py` | lm_head logits + fp32 cross-entropy + TRL's entropy and accuracy + rewind's per-row losses (no logits tensor) | 1.1% |
 | `embed_fp32_kernel` | `solution/integrate.py` | the fp32 embedding lookup (the weight is now stored in fp16) | <0.1% |
 
 Every kernel above also launches in every training step. The harness's launch counter (check 3)
@@ -45,12 +45,15 @@ Ideas taken from other work, with links (we wrote the code ourselves):
 - The hand-off of per-token losses to the rewind recorder follows Soup's own `stream_loss_chunk`
   design (Soup 0.77.0, `soup_cli/utils/stream_loss_chunk.py`); we do not enable that option.
 
-## Results on Kaggle T4 (from `runs/result.json` and `runs/checks.json` of the notebook above)
+## Results on Kaggle T4 (`runs/result.json` and `runs/checks.json` of our run of this commit, `harness/run_task.py --repeats 2`; the notebook above runs the same commit)
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s | 84.9 | 48.0 | speedup 1.77x |
-| Peak GPU memory, MiB | 14,345 | 2,831 | base/ours 5.07x |
-| Eval loss (public rows) | 2.04968 | 2.04965 | -0.001% vs base |
+| Time of `soup train`, s | 85.3 | 45.5 | speedup 1.88x |
+| Peak GPU memory, MiB | 14,345 | 2,287 | base/ours 6.27x |
+| Eval loss (public rows) | 2.04963 | 2.04966 | +0.001% vs base |
+
+T4 sessions differ by ~10% in speed (the README has an earlier session's numbers and the sweep of
+the activation budget, the speed/memory trade-off); the memory peak is the same in every session.
 
 - [x] All 10 checks of `harness/check_rules.py` passed
 - [x] README.md rewritten for our solution: what we did, how to run it, results, limits
@@ -61,7 +64,9 @@ base (speed, memory, quality, the budget sweep of the speed/memory trade-off), l
 steps — see the README.
 
 ## Limitations
-See the README: ~19 s outside the training loop (imports, model loading, setup, saving; `startup.py`
-already removes ~3 s of it) caps the speedup; cuBLAS GEMMs are
-now ~65% of a step; PyTorch's dropout kernel still draws the masks; attention is per-row SDPA; the
-fused path covers exactly this model/adapter setup and falls back to the original code otherwise.
+See the README: ~14 s outside the training loop (imports, model loading, setup, saving), ~5 s of it
+before `apply()` runs, caps the speedup; cuBLAS GEMMs are ~67% of a step's GPU time, and the GPU
+still waits for the CPU ~6% of a step (kernel launches); PyTorch's dropout kernel still draws the
+masks; k/v are repeated for the attention kernel; memory is a choice of the activation budget
+(~1 s of recomputation per 300 MiB); the fused path covers exactly this model/adapter setup and
+falls back to the original code otherwise.
