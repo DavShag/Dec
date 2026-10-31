@@ -63,7 +63,7 @@ def _compile_all(dims, warm):
          grid=GRID)
     warm(norm.add_rmsnorm_fwd_kernel,
          f32, f16, f32, f32, f16, f32, f32, torch.bool, torch.bool, i64, u8, f16, f16, hidden,
-         1e-6, 1.05, 1.05, 1, 0, 1, BLOCK_H=block_h, num_warps=8, grid=GRID)
+         1e-6, 1.05, 1.05, 1, 1, 0, 1, BLOCK_H=block_h, num_warps=8, grid=GRID)
     slot = (u8, u8, f32, f32, f32, f16, 0.5, 1024)
     warm(nf4.nf4_dequant_kernel, *slot, *slot, *slot, 16, 16, BLOCK=nf4.BLOCK_BYTES, num_warps=4,
          enable_fp_fusion=False, grid=GRID)
@@ -80,8 +80,8 @@ def _compile_all(dims, warm):
     warm(swiglu.example_swiglu_bwd_kernel, f16, f16, f16, f16, f16, 8960 * 16,
          BLOCK=swiglu.BLOCK, grid=GRID)
     warm(norm.add_rmsnorm_bwd_kernel,
-         f32, f32, f32, f16, f32, f32, f16, f16, u8, f16, f16, f32, f16, hidden, 1.05, 1.05, 1, 0,
-         1, 1, 1, 1, BLOCK_H=block_h, num_warps=8, grid=GRID)
+         f32, f16, f32, f32, f16, f32, f32, f16, f16, u8, f16, f16, f32, f16, hidden, 1.05, 1.05,
+         1, 1, 0, 1, 1, 1, 1, BLOCK_H=block_h, num_warps=8, grid=GRID)
 
 
 def _build_launcher(kernel):

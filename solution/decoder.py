@@ -109,11 +109,12 @@ class ModelPlan:
         self.final_norm = model.norm
         hidden, inter = config.hidden_size, config.intermediate_size
         q_size, kv_size = self.nq * self.head_dim, self.nkv * self.head_dim
-        # bytes a layer keeps for backward per token: two fp32 norm inputs, the adapters' keep
-        # masks packed 8 per byte (their fp16 inputs are rebuilt, AddRMSNorm adapters), q, the
-        # distinct k/v heads and the attention output in fp16, gate and up in fp16
-        self.kept_per_token = (2 * 4 * hidden + 2 * hidden // 8 + 2 * (2 * q_size + 2 * kv_size)
-                               + 2 * 2 * inter)
+        # bytes a layer keeps for backward per token: the fp32 input of norm1 and, for norm2, the
+        # fp16 o_proj output added to it (norm2's input is formed again from both), the adapters'
+        # keep masks packed 8 per byte (their fp16 inputs are rebuilt, AddRMSNorm adapters), q,
+        # the distinct k/v heads and the attention output in fp16, gate and up in fp16
+        self.kept_per_token = (4 * hidden + 2 * hidden + 2 * hidden // 8
+                               + 2 * (2 * q_size + 2 * kv_size) + 2 * 2 * inter)
         self.mlp_dropped_per_token = 2 * 2 * inter  # gate and up, for a RecomputedMLP layer
         self.recomputed_per_token = 6 * hidden  # a recomputed layer keeps only its inputs
 
@@ -282,21 +283,22 @@ class SwiGLU(torch.autograd.Function):
 class RecomputedMLP(torch.autograd.Function):
     """silu(gate) * up for [gate, up] = m16 @ [Wg; Wu].T, without keeping gate and up for backward.
 
-    m16 is norm2's output: backward rebuilds it from the fp32 sum norm2 keeps anyway (the same
-    kernel on the same values, so the same bits), repeats the gate|up GEMMs, and then forms
-    exactly what SwiGLU's and NF4Linear's backward form, with the same kernels and GEMMs."""
+    m16 is norm2's output: backward rebuilds it from norm2's input x + delta, which norm2 keeps
+    anyway (the same kernel on the same values, so the same bits), repeats the gate|up GEMMs, and
+    then forms exactly what SwiGLU's and NF4Linear's backward form, with the same kernels and
+    GEMMs."""
 
     @staticmethod
-    def forward(ctx, m16, total, norm_weight, eps, weights):
+    def forward(ctx, m16, x, delta, norm_weight, eps, weights):
         gate, up = nf4_linear(m16, weights)
-        ctx.save_for_backward(total, norm_weight)
+        ctx.save_for_backward(x, delta, norm_weight)
         ctx.eps, ctx.weights = eps, weights
         return _swiglu_out(gate, up)
 
     @staticmethod
     def backward(ctx, grad):
-        total, norm_weight = ctx.saved_tensors
-        flat = rmsnorm16(total, norm_weight, ctx.eps).view(-1, total.shape[-1])
+        x, delta, norm_weight = ctx.saved_tensors
+        flat = rmsnorm16(x, norm_weight, ctx.eps, delta=delta).view(-1, x.shape[-1])
         dense = dequantize_stack(ctx.weights)  # one buffer for both GEMMs of this backward
         parts, row = [], 0
         for w in ctx.weights:
@@ -304,7 +306,7 @@ class RecomputedMLP(torch.autograd.Function):
             row += w.rows
         gate, up = _swiglu_grads_in_place(grad, *(flat @ part.t() for part in parts))
         grad_m16 = torch.addmm(gate @ parts[0], up, parts[1])  # NF4Linear's backward GEMMs
-        return grad_m16.view(total.shape), None, None, None, None
+        return grad_m16.view(x.shape), None, None, None, None, None
 
 
 def _layer(plan, layer, x, pending, cos, sin, unpad, recompute_mlp=False):
@@ -330,13 +332,15 @@ def _layer(plan, layer, x, pending, cos, sin, unpad, recompute_mlp=False):
     q, k, v = qkv_rope(qkv, lq, lv, cos, sin, unpad.pidx, unpad.seq, plan.nq, plan.nkv,
                        plan.head_dim)
     attn = CausalAttention.apply(q, k, v, unpad.rows, layer.scaling, plan.nq // plan.nkv)
-    residual, m16, _, _, _ = add_rmsnorm(residual, nf4_linear(attn, layer.o), layer.norm2.weight,
-                                         plan.eps)
+    o16 = nf4_linear(attn, layer.o)
+    # norm2 keeps its fp16 delta, not the fp32 sum: its x is the layer's input, kept by norm1
+    total2, m16, _, _, _ = add_rmsnorm(residual, o16, layer.norm2.weight, plan.eps, keep_sum=False)
     if recompute_mlp:
-        act = RecomputedMLP.apply(m16, residual, layer.norm2.weight, plan.eps, tuple(layer.gate_up))
+        act = RecomputedMLP.apply(m16, residual, o16, layer.norm2.weight, plan.eps,
+                                  tuple(layer.gate_up))
     else:
         act = SwiGLU.apply(*nf4_linear(m16, layer.gate_up))
-    return residual, nf4_linear(act, layer.down)
+    return total2, nf4_linear(act, layer.down)
 
 
 def decoder_forward(model, plan, input_ids, attention_mask, position_ids):
@@ -362,6 +366,7 @@ def decoder_forward(model, plan, input_ids, attention_mask, position_ids):
                                     use_reentrant=False, preserve_rng_state=True)
         else:  # the next `mlp` layers repeat only their gate|up GEMMs in backward
             x, pending = _layer(plan, layer, x, pending, cos, sin, unpad, index < full + mlp)
+    unpad.ones = None  # drawn from for the masks of the last layer; a recomputed layer makes it again
     _, hidden, _, _, _ = add_rmsnorm(x, pending, plan.final_norm.weight, plan.eps)
     return hidden, unpad
 

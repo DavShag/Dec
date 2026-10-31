@@ -465,8 +465,10 @@ def _nf4_weights(shapes, seed=0):
     return tuple(out)
 
 
-def test_recomputed_mlp_is_the_kept_one_bitwise():
-    """Repeating gate|up in backward forms the same bits as keeping them."""
+def test_recomputed_mlp_and_kept_parts_are_the_kept_sum_bitwise():
+    """norm2 keeping x and its fp16 delta instead of their fp32 sum, and repeating gate|up in
+    backward from them, form the same bits as keeping the sum and gate/up: outputs and gradients,
+    the gradient through the sum (the residual stream) included."""
     from solution.decoder import RecomputedMLP, SwiGLU
     from solution.nf4 import nf4_linear
     from solution.norm import add_rmsnorm
@@ -478,19 +480,23 @@ def test_recomputed_mlp_is_the_kept_one_bitwise():
     attn_out = (torch.randn(n, hidden, device="cuda") * 2).half()
     norm_weight = torch.rand(hidden, device="cuda") + 0.5
     grad = torch.randn(n, inter, device="cuda").half()
+    grad_sum = torch.randn(n, hidden, device="cuda")
     results = []
-    for recompute in (False, True):
+    for keep_sum, recompute in ((True, False), (False, False), (False, True)):
         x = residual.clone().requires_grad_()
         delta = attn_out.clone().requires_grad_()
-        total, m16, _, _, _ = add_rmsnorm(x, delta, norm_weight, 1e-6)
+        total, m16, _, _, _ = add_rmsnorm(x, delta, norm_weight, 1e-6, keep_sum=keep_sum)
+        saved = total.grad_fn.saved_tensors
+        assert any(t is delta for t in saved) != keep_sum  # the delta kept instead of the sum
         if recompute:
-            act = RecomputedMLP.apply(m16, total, norm_weight, 1e-6, weights)
+            act = RecomputedMLP.apply(m16, x, delta, norm_weight, 1e-6, weights)
         else:
             act = SwiGLU.apply(*nf4_linear(m16, weights))
-        act.backward(grad)
-        results.append((act.detach(), x.grad, delta.grad))
-    for kept, repeated in zip(*results):
-        assert torch.equal(kept, repeated)
+        torch.autograd.backward([act, total], [grad, grad_sum])
+        results.append((act.detach(), total.detach(), x.grad, delta.grad))
+    for kept, *others in zip(*results):
+        for other in others:
+            assert torch.equal(kept, other)
 
 
 def test_add_rmsnorm_adapters_are_peft_lora_a_bitwise():
