@@ -28,7 +28,7 @@ import triton.language as tl
 from .nf4 import scratch
 
 IGNORE_INDEX = -100
-CHUNK = 256        # logits rows alive at once: 256 x 151936 fp16 = 74 MiB
+CHUNK = 192        # logits rows alive at once: 192 x 151936 fp16 = 55.6 MiB
 BLOCK_V = 2048
 GRAD_SCALE = 1024.0
 

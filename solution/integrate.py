@@ -88,7 +88,7 @@ def prepare_model(model):
         return False  # spread over devices (no CUDA_VISIBLE_DEVICES on a multi-GPU machine)
     if embed.weight.dtype == torch.float32:
         embed.weight.data = embed.weight.data.to(torch.float16).contiguous()
-        embed.forward = types.MethodType(_embedding_fp32_forward, embed)
+    embed.forward = types.MethodType(_embedding_fp32_forward, embed)
     if head.weight.dtype == torch.float32:  # not tied: the head alone
         head.weight.data = head.weight.data.to(torch.float16).contiguous()
     setattr(causal, FUSED_ATTR, True)
@@ -111,6 +111,10 @@ def patch_setup():
         warmup.start()  # no-op: apply() started it (kept for a setup reached without apply())
         result = original(self, *args, **kwargs)
         prepare_model(getattr(self, "model", None))
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return result
 
     _setup_transformers._soupk = True

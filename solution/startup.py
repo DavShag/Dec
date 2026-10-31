@@ -115,6 +115,33 @@ def patch_nf4_table():
     get_4bit_type._soupk = True
     bnb_functional.get_4bit_type = get_4bit_type
 
+def patch_peft_kbit():
+    try:
+        import peft.utils.other
+    except ImportError:
+        return
+    original = peft.utils.other.prepare_model_for_kbit_training
+    if getattr(original, "_soupk", False):
+        return
+
+    def prepare_model_for_kbit_training(model, *args, **kwargs):
+        embed = getattr(model, "get_input_embeddings", lambda: None)()
+        if embed is not None and hasattr(embed, "to"):
+            orig_to = embed.to
+            embed.to = lambda *a, **kw: embed
+            try:
+                res = original(model, *args, **kwargs)
+            finally:
+                embed.to = orig_to
+            return res
+        return original(model, *args, **kwargs)
+
+    prepare_model_for_kbit_training._soupk = True
+    import peft
+    peft.prepare_model_for_kbit_training = prepare_model_for_kbit_training
+    peft.utils.other.prepare_model_for_kbit_training = prepare_model_for_kbit_training
+
+
 
 def _collect_then_freeze():
     gc.collect()  # the run's garbage, finalized now as shutdown's first pass would

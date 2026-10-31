@@ -6,7 +6,7 @@ what each kernel does and where the ideas come from.
 
 from . import warmup
 from .integrate import patch_causal_lm, patch_setup, patch_sft_trainer
-from .startup import library_imports, patch_checkpoint_loading, patch_dataset_map, patch_nf4_table
+from .startup import library_imports, patch_checkpoint_loading, patch_dataset_map, patch_nf4_table, patch_peft_kbit
 from .swiglu import patch_qwen2_mlp
 
 
@@ -19,4 +19,5 @@ def apply():
         patch_dataset_map()          # startup.py: no dill pickling of the tokenizer for a fingerprint
         patch_checkpoint_loading()   # startup.py: bf16 -> fp16 on the GPU while loading
         patch_nf4_table()            # startup.py: one NF4 table, not one per quantized linear
+        patch_peft_kbit()            # startup.py: keep embedding fp16 during kbit training setup
     warmup.start()   # warmup.py: compile our kernels and their launchers in the background

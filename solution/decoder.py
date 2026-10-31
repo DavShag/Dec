@@ -42,7 +42,7 @@ PLAN_ATTR = "_soupk_plan"
 # run; 800 MiB -> 2,347 MiB for ~3 s more. With the reported best runs (~37 s, ~2.2 GB) the scores
 # of the three are within noise, and a tie goes to the lower memory: we use 800 (README,
 # "Adaptive recomputation").
-ACTIVATION_BUDGET_MB = 800
+ACTIVATION_BUDGET_MB = 300
 _ATEN = torch.ops.aten
 _EFFICIENT_ATTENTION = all(hasattr(_ATEN, name) for name in (
     "_efficient_attention_forward", "_efficient_attention_backward"))
@@ -241,7 +241,8 @@ class CausalAttention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         q, k_kv, v_kv, out, lse, seed, offset, offsets = ctx.saved_tensors
-        k, v = (t.repeat_interleave(ctx.group, dim=1) for t in (k_kv, v_kv))
+        k = k_kv[:, :, None, :].expand(-1, -1, ctx.group, -1).reshape(k_kv.shape[0], -1, k_kv.shape[-1]).contiguous()
+        v = v_kv[:, :, None, :].expand(-1, -1, ctx.group, -1).reshape(v_kv.shape[0], -1, v_kv.shape[-1]).contiguous()
         tokens = (1,) + q.shape
         dq, dk, dv, _ = _ATEN._efficient_attention_backward(
             grad.contiguous().view(tokens), q[None], k[None], v[None], None, out.view(tokens),
