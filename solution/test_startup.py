@@ -35,3 +35,35 @@ def test_in_memory_map_skips_the_function_hash(monkeypatch):
             for i in range(64)]
     mapped = Dataset.from_list(rows).map(format_row, remove_columns=["text"])
     assert mapped["ids"] == [format_row(row)["ids"] for row in rows]
+
+
+def test_trl_gets_the_package_mapping_a_scan_returns():
+    import importlib.metadata
+
+    from solution.startup import _known_package_mapping
+
+    original = importlib.metadata.packages_distributions
+    scanned = original()
+    with _known_package_mapping():
+        assert importlib.metadata.packages_distributions is not original
+        handed = importlib.metadata.packages_distributions()
+        handed["solution-test"] = []  # a copy: trl cannot change transformers' mapping
+        assert importlib.metadata.packages_distributions().keys() == scanned.keys()
+    assert {name: sorted(d) for name, d in handed.items() if name != "solution-test"} == \
+        {name: sorted(d) for name, d in scanned.items()}
+    assert importlib.metadata.packages_distributions is original
+
+
+def test_library_imports_pause_the_collector_and_freeze_what_they_created():
+    import gc
+
+    from solution.startup import library_imports
+
+    assert gc.isenabled()
+    frozen_before = gc.get_freeze_count()
+    with library_imports():
+        assert not gc.isenabled()
+        made = [[] for _ in range(1000)]  # long-lived objects created while importing
+    assert gc.isenabled()
+    assert gc.get_freeze_count() >= frozen_before + len(made)
+    gc.unfreeze()  # leave the test process as it was

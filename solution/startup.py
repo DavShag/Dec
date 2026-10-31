@@ -1,7 +1,7 @@
-"""The start of `soup train`: three costs moved or removed, none of the values the run produces changed.
+"""The start and end of `soup train`: costs moved or removed, none of the values the run produces changed.
 
-The measured time is the whole command, and ~20 s of it are not training (README). Three of those
-costs are avoidable:
+The measured time is the whole command, and ~20 s of it are not training (README). Avoidable in
+loading the model and the data:
 - `datasets` fingerprints each `Dataset.map` by pickling the mapped function with dill. Soup's
   formatting function closes over the tokenizer, so the map pickles its 151k-entry vocabulary:
   ~88% of the map's time (cProfile), the tokenization itself is ~10%. For a dataset held in memory
@@ -14,9 +14,27 @@ costs are avoidable:
   weights.
 - bitsandbytes builds its 16-entry NF4 table anew, with a host-to-device copy, for each of the 196
   linears it quantizes; we build it once per device.
+
+Avoidable in `apply()`'s imports of Soup's libraries (`library_imports`), and at the exit:
+- trl's import calls `importlib.metadata.packages_distributions()`, which reads the metadata of
+  every installed distribution (hundreds on Kaggle's image). transformers' import, in the
+  harness, made the same call moments earlier in the same environment and keeps the result
+  (read-only); while trl imports, the call returns a copy of it.
+- Python's cyclic garbage collector: the libraries import ~500k objects (modules, classes,
+  functions) that live until the process exits. While they import, every full collection walks
+  all of them, and the interpreter's shutdown walks them again in several passes (~0.8 s of the
+  exit on our machine). They import with the collector paused and are then moved to its permanent
+  generation (`gc.freeze`), so later passes skip them; at exit, one ordinary collection finalizes
+  the run's garbage before shutdown, then the rest is frozen too. Reference counting frees objects
+  as before; only cycles among the frozen, long-lived objects are never collected, and every
+  output of the run is written and closed by then (Soup writes each rewind line under its own
+  `open` and commits its database after each write).
 """
 
+import atexit
+import contextlib
 import functools
+import gc
 import inspect
 
 import torch
@@ -82,3 +100,52 @@ def patch_nf4_table():
 
     get_4bit_type._soupk = True
     bnb_functional.get_4bit_type = get_4bit_type
+
+
+def _collect_then_freeze():
+    gc.collect()  # the run's garbage, finalized now as shutdown's first pass would
+    gc.freeze()   # shutdown's passes then skip every object still alive
+
+
+@contextlib.contextmanager
+def _known_package_mapping():
+    """packages_distributions() returns a copy of the mapping transformers computed at import."""
+    import importlib.metadata
+
+    try:
+        from transformers.utils import import_utils
+
+        known = import_utils.PACKAGE_DISTRIBUTION_MAPPING
+    except (ImportError, AttributeError):
+        known = None
+    if not isinstance(known, dict):
+        yield
+        return
+    original = importlib.metadata.packages_distributions
+
+    def packages_distributions():
+        return {name: list(dists) for name, dists in known.items()}
+
+    importlib.metadata.packages_distributions = packages_distributions
+    try:
+        yield
+    finally:
+        importlib.metadata.packages_distributions = original
+
+
+@contextlib.contextmanager
+def library_imports():
+    """`apply()`'s imports: the collector paused and trl handed the known package mapping; what
+    they created is then frozen, and the exit collects once, then freezes the rest."""
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with _known_package_mapping():
+            yield
+    finally:
+        gc.freeze()
+        if enabled:
+            gc.enable()
+    if not getattr(_collect_then_freeze, "_registered", False):
+        _collect_then_freeze._registered = True
+        atexit.register(_collect_then_freeze)

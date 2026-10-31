@@ -12,6 +12,7 @@ launch options), or the compiled variant would not be the one training asks for.
 
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import triton
@@ -38,7 +39,8 @@ def _model_dims():
             config.num_key_value_heads, head_dim)
 
 
-def _compile_all(dims):
+def _compile_all(dims, compiled):
+    """Compile every variant a training step launches; `compiled` gets each compiled kernel."""
     from . import integrate, lce, nf4, norm, rope, swiglu
 
     hidden, vocab, nq, nkv, head_dim = dims
@@ -46,37 +48,54 @@ def _compile_all(dims):
     block_h = triton.next_power_of_2(hidden)
     heads = triton.next_power_of_2(nq)
     # forward, in the order a step first needs them
-    integrate.embed_fp32_kernel.warmup(i64, f16, f32, hidden, BLOCK_H=block_h, num_warps=4,
-                                       grid=GRID)
-    norm.add_rmsnorm_fwd_kernel.warmup(
+    compiled(integrate.embed_fp32_kernel.warmup(i64, f16, f32, hidden, BLOCK_H=block_h,
+                                                num_warps=4, grid=GRID))
+    compiled(norm.add_rmsnorm_fwd_kernel.warmup(
         f32, f16, f32, f32, f16, f32, f32, torch.bool, torch.bool, i64, u8, f16, f16, hidden,
-        1e-6, 1.05, 1.05, 1, 0, 1, BLOCK_H=block_h, num_warps=8, grid=GRID)
+        1e-6, 1.05, 1.05, 1, 0, 1, BLOCK_H=block_h, num_warps=8, grid=GRID))
     slot = (u8, u8, f32, f32, f32, f16, 0.5, 1024)
-    nf4.nf4_dequant_kernel.warmup(*slot, *slot, *slot, 16, 16, BLOCK=nf4.BLOCK_BYTES, num_warps=4,
-                                  enable_fp_fusion=False, grid=GRID)
-    rope.qkv_rope_fwd_kernel.warmup(f16, f16, f16, f32, f32, i64, f16, f16, f16, 64, 0, NQ=nq,
-                                    NKV=nkv, D=head_dim, HEADS=heads, HAS_LQ=True, HAS_LV=True,
-                                    num_warps=4, grid=GRID)
-    swiglu.example_swiglu_fwd_kernel.warmup(f16, f16, f16, 8960 * 16, BLOCK=swiglu.BLOCK,
-                                            grid=GRID)
-    lce.lce_row_kernel.warmup(f16, vocab, i64, f32, f32, i32, vocab, lce.GRAD_SCALE, 1,
-                              BLOCK_V=lce.BLOCK_V, num_warps=8, grid=GRID)
+    compiled(nf4.nf4_dequant_kernel.warmup(*slot, *slot, *slot, 16, 16, BLOCK=nf4.BLOCK_BYTES,
+                                           num_warps=4, enable_fp_fusion=False, grid=GRID))
+    compiled(rope.qkv_rope_fwd_kernel.warmup(f16, f16, f16, f32, f32, i64, f16, f16, f16, 64, 0,
+                                             NQ=nq, NKV=nkv, D=head_dim, HEADS=heads, HAS_LQ=True,
+                                             HAS_LV=True, num_warps=4, grid=GRID))
+    compiled(swiglu.example_swiglu_fwd_kernel.warmup(f16, f16, f16, 8960 * 16, BLOCK=swiglu.BLOCK,
+                                                     grid=GRID))
+    compiled(lce.lce_row_kernel.warmup(f16, vocab, i64, f32, f32, i32, vocab, lce.GRAD_SCALE, 1,
+                                       BLOCK_V=lce.BLOCK_V, num_warps=8, grid=GRID))
     # backward
-    rope.qkv_rope_bwd_kernel.warmup(f16, f16, f16, f32, f32, i64, f16, 64, 0, nq * head_dim,
-                                    head_dim, nq * head_dim, head_dim, nq * head_dim, head_dim,
-                                    NQ=nq, NKV=nkv, D=head_dim, HEADS=heads,
-                                    KV_HEADS=triton.next_power_of_2(nkv), num_warps=4, grid=GRID)
-    swiglu.example_swiglu_bwd_kernel.warmup(f16, f16, f16, f16, f16, 8960 * 16,
-                                            BLOCK=swiglu.BLOCK, grid=GRID)
-    norm.add_rmsnorm_bwd_kernel.warmup(
+    compiled(rope.qkv_rope_bwd_kernel.warmup(f16, f16, f16, f32, f32, i64, f16, 64, 0,
+                                             nq * head_dim, head_dim, nq * head_dim, head_dim,
+                                             nq * head_dim, head_dim, NQ=nq, NKV=nkv, D=head_dim,
+                                             HEADS=heads, KV_HEADS=triton.next_power_of_2(nkv),
+                                             num_warps=4, grid=GRID))
+    compiled(swiglu.example_swiglu_bwd_kernel.warmup(f16, f16, f16, f16, f16, 8960 * 16,
+                                                     BLOCK=swiglu.BLOCK, grid=GRID))
+    compiled(norm.add_rmsnorm_bwd_kernel.warmup(
         f32, f32, f32, f16, f32, f32, f16, f16, u8, f16, f16, f32, f16, hidden, 1.05, 1.05, 1, 0, 1,
-        1, 1, 1, BLOCK_H=block_h, num_warps=8, grid=GRID)
+        1, 1, 1, BLOCK_H=block_h, num_warps=8, grid=GRID))
 
-def _run():
+
+def _build_launcher(kernel):
+    """Build the C launcher of a compiled kernel into the Triton cache.
+
+    Triton creates a kernel's launcher, a small C extension compiled with the system's C compiler
+    and cached by its source, only at the kernel's first launch: one compiler run per kernel
+    signature, inside the first training step. Building it here leaves that launch only the
+    cached module to load (the launch still does that itself: this thread never touches the
+    compiled kernel the launch uses)."""
+    from triton.runtime import driver
+
+    if kernel is not None and hasattr(kernel, "src"):
+        driver.active.launcher_cls(kernel.src, kernel.metadata)
+
+
+def _run(dims):
     try:
-        dims = _model_dims()
-        if dims is not None:
-            _compile_all(dims)
+        # a second thread builds each launcher while this one compiles the next kernel: both
+        # mostly wait on the compilers' subprocesses (ptxas, cc)
+        with ThreadPoolExecutor(1, thread_name_prefix="soupk-triton-launcher") as launchers:
+            _compile_all(dims, lambda kernel: launchers.submit(_build_launcher, kernel))
     except Exception:  # noqa: BLE001 - a warm-up failure only means compiling on first launch
         pass
 
@@ -84,13 +103,18 @@ def _run():
 def start():
     """Start compiling in the background, once (no-op outside `soup train` or without CUDA).
 
-    Called when Soup starts loading the model: the main thread is then mostly in I/O and CUDA, so
-    compiling barely slows it. Measured on the T4: starting earlier, in apply(), competes with
-    Soup's imports for the GIL and is no faster overall."""
+    The model's dimensions are read here, in the calling thread, so the warm-up threads import
+    nothing but Triton's compiler while the main thread is still importing Soup's libraries."""
     global _started
     if _started or not torch.cuda.is_available() or "--config" not in sys.argv:
         return None
     _started = True
-    thread = threading.Thread(target=_run, name="soupk-triton-warmup", daemon=True)
+    try:
+        dims = _model_dims()
+    except Exception:  # noqa: BLE001 - no warm-up: the kernels compile on first launch
+        return None
+    if dims is None:
+        return None
+    thread = threading.Thread(target=_run, args=(dims,), name="soupk-triton-warmup", daemon=True)
     thread.start()
     return thread

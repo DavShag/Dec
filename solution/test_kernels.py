@@ -395,12 +395,21 @@ def test_add_rmsnorm_lora_dropout_matches_pytorch():
     torch.testing.assert_close(ours[1].float(), delta.grad.float(), rtol=2e-3, atol=2e-3)
 
 
-def test_warmup_compiles_what_training_launches(tmp_path):
-    """Every kernel variant a training step launches is one the warm-up thread compiled: a stale
-    argument list in warmup.py would otherwise compile inside the measured steps, silently."""
+def test_warmup_compiles_what_training_launches(tmp_path, monkeypatch):
+    """Every kernel variant a training step launches is one the warm-up thread compiled, and its C
+    launcher one the warm-up built: a stale argument list in warmup.py would otherwise compile
+    inside the measured steps, silently."""
+    import triton.runtime.build
+
     import solution
     from solution import integrate, lce, nf4, norm, rope, swiglu, warmup
     from solution.integrate import prepare_model
+
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton_cache"))  # nothing built yet
+    c_builds = []
+    build = triton.runtime.build._build
+    monkeypatch.setattr(triton.runtime.build, "_build",
+                        lambda name, *args: c_builds.append(name) or build(name, *args))
 
     kernels = (integrate.embed_fp32_kernel, norm.add_rmsnorm_fwd_kernel,
                norm.add_rmsnorm_bwd_kernel, nf4.nf4_dequant_kernel, rope.qkv_rope_fwd_kernel,
@@ -419,8 +428,11 @@ def test_warmup_compiles_what_training_launches(tmp_path):
     assert prepare_model(model)
     for kernel in kernels:  # forget what earlier tests compiled: only the warm-up's variants
         kernel.device_caches.clear()
-    warmup._compile_all((256, 1024, 4, 2, 64))  # _tiny_qlora's hidden, vocab, heads, head_dim
+    # _tiny_qlora's hidden, vocab, heads, kv heads, head_dim
+    warmup._compile_all((256, 1024, 4, 2, 64), warmup._build_launcher)
     before = compiled()
+    assert c_builds  # the warm-up built the launchers (kernels of one signature share one)
+    c_builds.clear()
     ids = torch.randint(0, 1024, (3, 40), generator=torch.Generator().manual_seed(1)).cuda()
     mask = torch.ones_like(ids)
     mask[1, 31:] = 0
@@ -428,6 +440,7 @@ def test_warmup_compiles_what_training_launches(tmp_path):
     _train_step(model, {"input_ids": ids, "attention_mask": mask, "labels": labels,
                         "use_cache": False}, seed=3)
     assert compiled() == before
+    assert c_builds == []  # the step's first launches only loaded cached launchers
 
 
 def _nf4_weights(shapes, seed=0):
