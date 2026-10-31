@@ -85,10 +85,29 @@ def nf4_supported(module):
             and weight.data.numel() * 2 == state.shape[0] * state.shape[1])
 
 
-def dequantize_stack(weights):
-    """The weights stacked by rows, fp16 [sum(rows), cols]: one launch per three weights."""
-    out = torch.empty((sum(w.rows for w in weights), weights[0].cols), dtype=torch.float16,
-                      device=weights[0].packed.device)
+_SCRATCH = {}
+
+
+def scratch(numel, device):
+    """fp16 [numel], a view of one buffer per device for transients of which only one is alive at
+    a time: the dense weights of a dequantize launch, which the GEMMs right after it read, and the
+    fused head's chunk of logits (lce.py). Their uses follow one another in one CUDA stream, so
+    reusing the memory is safe, and the allocator no longer cuts holes of their sizes among the
+    activations (on the T4 it reserved ~150 MiB more than it had allocated at the peak).
+    Allocated at its largest size when the model is prepared (integrate.prepare_model), before
+    any activation."""
+    buffer = _SCRATCH.get(device)
+    if buffer is None or buffer.numel() < numel:
+        _SCRATCH[device] = buffer = torch.empty(numel, dtype=torch.float16, device=device)
+    return buffer[:numel]
+
+
+def dequantize_stack(weights, into_scratch=False):
+    """The weights stacked by rows, fp16 [sum(rows), cols]: one launch per three weights. With
+    into_scratch the result is a view of the shared scratch buffer, valid until its next use."""
+    rows, cols, device = sum(w.rows for w in weights), weights[0].cols, weights[0].packed.device
+    out = (scratch(rows * cols, device).view(rows, cols) if into_scratch else
+           torch.empty((rows, cols), dtype=torch.float16, device=device))
     row = 0
     for first in range(0, len(weights), 3):
         group, slots = weights[first:first + 3], []
@@ -119,7 +138,7 @@ class NF4Linear(torch.autograd.Function):
     def forward(ctx, x, weights, bias):
         flat = x.reshape(-1, x.shape[-1]).to(torch.float16)
         ctx.weights, ctx.in_shape, ctx.in_dtype = weights, x.shape, x.dtype
-        dense = dequantize_stack(weights)
+        dense = dequantize_stack(weights, into_scratch=True)  # read by the GEMMs below only
         if len(weights) == 1 or bias is not None:
             out = torch.addmm(bias, flat, dense.t()) if bias is not None else flat @ dense.t()
             return out.view(*x.shape[:-1], out.shape[-1])
@@ -132,7 +151,7 @@ class NF4Linear(torch.autograd.Function):
     @staticmethod
     @torch.autocast("cuda", enabled=False)
     def backward(ctx, *grads):
-        dense = dequantize_stack(ctx.weights)
+        dense = dequantize_stack(ctx.weights, into_scratch=True)
         if len(grads) == 1:
             grad = grads[0].reshape(-1, dense.shape[0]).to(torch.float16)
             grad_x = grad @ dense

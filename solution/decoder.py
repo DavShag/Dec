@@ -300,7 +300,7 @@ class RecomputedMLP(torch.autograd.Function):
     def backward(ctx, grad):
         x, delta, norm_weight = ctx.saved_tensors
         flat = rmsnorm16(x, norm_weight, ctx.eps, delta=delta).view(-1, x.shape[-1])
-        dense = dequantize_stack(ctx.weights)  # one buffer for both GEMMs of this backward
+        dense = dequantize_stack(ctx.weights, into_scratch=True)  # for both GEMMs below
         parts, row = [], 0
         for w in ctx.weights:
             parts.append(dense[row:row + w.rows])

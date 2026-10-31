@@ -25,6 +25,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .nf4 import scratch
+
 IGNORE_INDEX = -100
 CHUNK = 256        # logits rows alive at once: 256 x 151936 fp16 = 74 MiB
 BLOCK_V = 2048
@@ -97,7 +99,8 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
         token_loss = torch.zeros(n, dtype=torch.float32, device=flat.device)
         hits = torch.zeros(n, dtype=torch.int32, device=flat.device)
         grad_rows = torch.zeros_like(flat, dtype=torch.float16) if with_grad else None
-        buffer = torch.empty((min(CHUNK, n), vocab), dtype=torch.float16, device=flat.device)
+        rows_at_once = min(CHUNK, n)  # the logits of a chunk, in the shared scratch buffer
+        buffer = scratch(rows_at_once * vocab, flat.device).view(rows_at_once, vocab)
         weight_t = weight.t()
 
         for rows, grad in ((labelled.nonzero().squeeze(1), with_grad),

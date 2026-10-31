@@ -23,9 +23,10 @@ import torch
 import triton
 import triton.language as tl
 
+from . import lce, warmup
 from .decoder import PLAN_ATTR, decoder_forward, plain_training_call, prepare_decoder
-from . import warmup
 from .lce import fused_linear_cross_entropy
+from .nf4 import scratch
 
 FUSED_ATTR = "_soupk_fused_head"
 _LAST = {}
@@ -91,7 +92,11 @@ def prepare_model(model):
     if head.weight.dtype == torch.float32:  # not tied: the head alone
         head.weight.data = head.weight.data.to(torch.float16).contiguous()
     setattr(causal, FUSED_ATTR, True)
-    prepare_decoder(causal.model)
+    plan = getattr(causal.model, PLAN_ATTR, None) if prepare_decoder(causal.model) else None
+    dense = max((sum(w.rows for w in group) * group[0].cols for layer in plan.layers
+                 for group in (layer.qkv, layer.o, layer.gate_up, layer.down)), default=0) \
+        if plan is not None else 0
+    scratch(max(lce.CHUNK * head.weight.shape[0], dense), head.weight.device)  # its largest use
     return True
 
 
